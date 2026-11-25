@@ -80,7 +80,12 @@ export function fitCamera(net: Network, w: number, h: number): Camera {
 }
 
 /** Metres of approach road kept in view around each junction: room for a typical signal queue. */
-const FOCUS_APPROACH = 120;
+const FOCUS_APPROACH = 80;
+/**
+ * The opening view is never zoomed out below this (pixels per metre; a car is then about 16 px
+ * long). A network too large to frame at this scale opens centred on its junctions instead.
+ */
+const MIN_OPEN_ZOOM = 3.5;
 
 /**
  * Opening view: frame where traffic interacts, with FOCUS_APPROACH metres of road around it, so
@@ -103,17 +108,17 @@ export function focusCamera(net: Network, w: number, h: number): Camera {
       }
     }
   }
-  if (hubs.length === 0) return whole;
+  if (hubs.length === 0) return { ...whole, zoom: Math.max(whole.zoom, MIN_OPEN_ZOOM) };
   const minX = Math.min(...hubs.map((p) => p.x)) - FOCUS_APPROACH;
   const maxX = Math.max(...hubs.map((p) => p.x)) + FOCUS_APPROACH;
   const minY = Math.min(...hubs.map((p) => p.y)) - FOCUS_APPROACH;
   const maxY = Math.max(...hubs.map((p) => p.y)) + FOCUS_APPROACH;
   const zoom = Math.min(w / (maxX - minX), h / (maxY - minY), 6);
-  return { x: (minX + maxX) / 2, y: (minY + maxY) / 2, zoom: Math.max(whole.zoom, zoom) };
+  return { x: (minX + maxX) / 2, y: (minY + maxY) / 2, zoom: Math.max(whole.zoom, zoom, MIN_OPEN_ZOOM) };
 }
 
 /** Smallest on-screen vehicle size in pixels, so traffic stays visible when zoomed out. */
-const MIN_VEHICLE_PX = { length: 7, width: 3 };
+const MIN_VEHICLE_PX = { length: 10, width: 4 };
 
 function laneElevated(l: Lane): boolean {
   return l.levelFrom > 0 || l.levelTo > 0;
