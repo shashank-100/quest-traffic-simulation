@@ -17,7 +17,7 @@ git clone https://github.com/shashank-100/quest-traffic-simulation.git
 cd quest-traffic-simulation
 npm install
 npm run dev        # app + API at http://localhost:5173
-npm test           # 82 tests
+npm test           # 91 tests
 npm run build      # typecheck + production build
 ```
 
@@ -31,7 +31,7 @@ npm run build      # typecheck + production build
   - `F` draws a flyover. It ramps up, passes over other roads without meeting them, and ramps down.
   - `S` adds a signal to a junction.
   - `V` selects a road or junction to edit lanes, width and speed limit, or signal timings.
-- **Traffic tab:** flows (origin, destination, veh/h, vehicle mix, speed factor), the seed, driving side, and routing.
+- **Traffic tab:** flows (origin, destination, optional via junctions to pass in order, veh/h, vehicle mix, speed factor), the seed, driving side, and routing.
 - **Compare scenarios:** runs two scenarios over several seeds and shows mean ± SD, % change and charts.
 - **Save & share:** stores the scenario on the server and copies a `?s=<id>` link. **Export** and **Import** handle JSON files.
 
@@ -42,16 +42,19 @@ npm run build      # typecheck + production build
   - **Following:** the Intelligent Driver Model (IDM), with the improved free-road term (IIDM) when above desired speed.
   - **Turns:** each vehicle plans for the junction curves on its route whatever the signal shows. Its desired speed is capped at the speed from which it can still brake comfortably to each curve's safe speed, so it accelerates between turns and brakes late and smoothly into them.
   - **Lane changes:** MOBIL, plus mandatory changes into a lane that serves the next turn.
-  - **Routing:** shortest path (Dijkstra), optionally based on observed travel times.
+  - **Routing:** shortest path (Dijkstra), optionally based on observed travel times. A flow can list via junctions; the route is the shortest path through each in order.
 - **Lane geometry:**
   - **Count:** each lane is its own queue.
   - **Width:** follows Highway Capacity Manual (HCM) adjustments, applied to each vehicle's side clearance. Narrow lanes lower desired speed (−10% at 3.0 m) and lengthen the desired headway (factor 1 + (W − 3.6)/9).
 - **Junctions:**
   - **Simple connections:** nodes with no signal and no crossing or merging movements, such as flyover deck joints and bends. Vehicles drive straight through.
   - **Intersections:** vehicles request their movement within a request zone. A request is refused if it crosses a movement already in use or would leave the vehicle stuck in the junction. Merging traffic uses gap acceptance.
-  - **Priority:** at unsignalised junctions the main road (more lanes, then higher speed limit, else the straight-through pair) has right of way. Side-road vehicles give way: they enter only when the gap between successive conflicting main-road vehicles is at least the HCM critical gap (6.2 s kerb-side turn, 6.5 s straight across, 7.1 s turn across traffic) and they can clear the junction before the next one arrives. Symmetric junctions are first come, first served.
+  - **Priority:** movements are ranked. At unsignalised junctions the main road (more lanes, then higher speed limit, else the straight-through pair) outranks the side road. Within a road, and at signals, straight-on and kerb-side turns outrank turns across oncoming traffic.
+    - A lower-ranked vehicle enters only when the gap between successive higher-ranked conflicting vehicles is at least its critical gap, and it can clear the junction before the next one arrives.
+    - Critical gaps follow the HCM: side road 6.2 s kerb-side, 6.5 s straight across, 7.1 s across traffic; permitted turns 4.5 s at a signal, 4.1 s for a main-road turn.
+    - Symmetric unsignalised junctions are first come, first served.
   - **Signals:**
-    - On yellow, a vehicle may enter only if it will reach the line before red.
+    - On yellow, a vehicle may enter only if it will reach the line before red. A turner still waiting at the line may clear on yellow if it can make it.
     - On red, nobody enters, and any earlier permission is withdrawn, except from a vehicle that can no longer stop before the line even at full braking. The yellow rule prevents that situation; in tests no vehicle ever entered on red.
 - **Flyovers:** roads only meet at shared nodes on the same level, so a deck never creates a false intersection. Ramps climb 6 m, and the slope reduces how hard vehicles can accelerate.
 
@@ -66,7 +69,7 @@ npm run build      # typecheck + production build
 | Lane width | 2.75 m | 3.0 m | 3.5 m | 4.0 m |
 | --- | --- | --- | --- | --- |
 | Capacity (1 lane) | 1,488 veh/h | 1,548 veh/h | 1,644 veh/h | 1,704 veh/h |
-| Free-flow trip speed (mixed traffic) | 39.6 km/h | 42.2 km/h | 48.8 km/h | 53.1 km/h |
+| Free-flow trip speed (mixed traffic) | 39.8 km/h | 42.1 km/h | 48.9 km/h | 53.4 km/h |
 
 **Lane drop:** a 3→2 lane drop discharges 2,682 veh/h, about 80% of two free lanes, in line with the capacity drop seen at real merges.
 
@@ -74,17 +77,17 @@ npm run build      # typecheck + production build
 
 | | At-grade signal | Flyover | Change |
 | --- | --- | --- | --- |
-| Average delay | 25.8 ± 4.4 s | 3.9 ± 0.4 s | −85% |
-| Average travel time | 86.8 s | 64.6 s | −26% |
-| Average trip speed | 31.1 km/h | 41.6 km/h | +34% |
-| Average total queue | 60.5 m | 0 m | −100% |
+| Average delay | 26.6 ± 4.7 s | 3.9 ± 0.6 s | −85% |
+| Average travel time | 87.7 s | 64.6 s | −26% |
+| Average trip speed | 30.8 km/h | 41.6 km/h | +35% |
+| Average total queue | 65.6 m | 0 m | −100% |
 | Throughput (after warm-up) | 2,882 ± 66 veh/h | 2,959 ± 68 veh/h | within noise: both carry the 2,940 veh/h demand |
 
 Demand is below capacity in both designs, so the flyover doesn't add throughput; it removes delay and queues.
 
 **Metrics:**
 - **Delay** compares each trip with the same driver alone on the empty network, simulated with the same dynamics (turns, ramps, lane widths). A lone vehicle has zero delay on every route, and no trip beats its reference by more than half a time step, so the flyover's remaining 3.9 s is entirely vehicles interacting.
-- **Throughput** excludes a warm-up equal to the longest free-flow trip time, about 100 s here, during which the network is still filling.
+- **Warm-up:** every performance figure (delay, travel time, speeds, queues, density, throughput) is measured after a warm-up equal to the longest free-flow trip time, about 100 s here, while the network fills. Trip averages use trips that entered after it.
 
 **Safety and robustness:** every preset was run for 30 minutes on several seeds. In every run:
 - no crossing movements were ever inside a junction together;
@@ -102,9 +105,16 @@ Demand is below capacity in both designs, so the flyover doesn't add throughput;
 | `GET` | `/api/scenarios/:id` | load one |
 | `POST` | `/api/simulate` | `{ scenario, duration ≤ 600, seed? }` → summary + time series |
 
+Limits on the public API:
+- **Request rate:** 20 simulations and 30 saves per minute per client.
+- **Network size:** 400 nodes, 600 roads and 100 flows for server-side runs.
+- **Work budget:** about 3 million lane-steps and 3 million vehicle-steps per run. Every preset uses under 15%.
+
+Larger runs return 413 with a suggestion to use the browser, which has no limits.
+
 ## Limitations
 
-- **Signals:** fixed-time only. Turns that cut across oncoming traffic at a signal are served first come, first served rather than yielding.
+- **Signals:** fixed-time only (no actuated or adaptive control).
 - **Lane width at signals:** changes discharge by about 1%, against about 7% in the HCM.
 - **Two-wheelers:** stay in lanes; filtering between lanes isn't modelled.
 - **Elevation:** there is only one elevated level.

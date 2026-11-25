@@ -76,7 +76,16 @@ export function App() {
       const roadsEdited = sc.roads !== scenario.roads;
       const removed = roadsEdited ? scenario.flows.length - sc.flows.length : 0;
       const redirected = roadsEdited ? sc.flows.filter((f) => f.destination === null && scenario.flows.some((o) => o.id === f.id && o.destination !== null)).length : 0;
-      const note = [removed > 0 && `${removed} flow(s) removed: their entry point is gone`, redirected > 0 && `${redirected} flow(s) now go to any exit`].filter(Boolean).join(' · ');
+      const viaDropped = roadsEdited
+        ? sc.flows.reduce((a, f) => a + Math.max(0, (scenario.flows.find((o) => o.id === f.id)?.via?.length ?? 0) - (f.via?.length ?? 0)), 0)
+        : 0;
+      const note = [
+        removed > 0 && `${removed} flow(s) removed: their entry point is gone`,
+        redirected > 0 && `${redirected} flow(s) now go to any exit`,
+        viaDropped > 0 && `${viaDropped} via point(s) dropped: no longer a junction`,
+      ]
+        .filter(Boolean)
+        .join(' · ');
       if (note) notify(`${opts?.message ? `${opts.message} · ` : ''}${note}`, 'error');
       else if (opts?.message) notify(opts.message + (sim.t > 0 ? ' · simulation restarted' : ''));
     },

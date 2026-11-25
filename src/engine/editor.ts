@@ -188,13 +188,22 @@ function pruneOrphans(sc: Scenario): void {
 /**
  * Keeps traffic consistent with the network after an edit: a flow whose origin is no longer an
  * entry point (deleted, extended into a through road, or made exit-only) is removed; a flow whose
- * destination is no longer an exit point falls back to "any exit".
+ * destination is no longer an exit point falls back to "any exit"; via points that are no longer
+ * junctions are dropped.
  */
 function reconcileFlows(sc: Scenario): void {
   const roles = endpointRoles(sc);
+  const degree = new Map<string, number>();
+  for (const r of sc.roads) for (const n of [r.from, r.to]) degree.set(n, (degree.get(n) ?? 0) + 1);
   sc.flows = sc.flows
     .filter((f) => roles.get(f.origin)?.entry)
-    .map((f) => (f.destination !== null && !roles.get(f.destination)?.exit ? { ...f, destination: null } : f));
+    .map((f) => (f.destination !== null && !roles.get(f.destination)?.exit ? { ...f, destination: null } : f))
+    .map((f) => {
+      if (!f.via) return f;
+      // Via points must still be junctions; collapse any repeats left after removals.
+      const via = f.via.filter((n) => (degree.get(n) ?? 0) >= 2).filter((n, i, a) => i === 0 || a[i - 1] !== n);
+      return via.length === f.via.length ? f : { ...f, via };
+    });
 }
 
 export function removeRoad(input: Scenario, roadId: string): Scenario {

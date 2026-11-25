@@ -17,13 +17,21 @@ describe('simulation metrics', () => {
     const sim = new Simulation(preset('four-way'));
     sim.run(400);
     const s = sim.summary();
-    const total = sim.trips.reduce((a, t) => a + t.travelTime, 0);
+    // Trip averages use trips that entered after the warm-up; time averages use samples after it.
+    const measured = sim.trips.filter((t) => t.exitT - t.travelTime >= s.warmup);
+    const total = measured.reduce((a, t) => a + t.travelTime, 0);
+    const after = sim.samples.filter((x) => x.t > s.warmup);
+    expect(s.measuredTrips).toBe(measured.length);
+    expect(s.measuredTrips).toBeGreaterThan(50);
+    expect(s.completed).toBe(sim.trips.length);
+    expect(s.avgQueueLength).toBeCloseTo(after.reduce((a, x) => a + x.queueLength, 0) / after.length, 9);
+    expect(s.maxQueueLength).toBeCloseTo(Math.max(...after.map((x) => x.maxLaneQueue)), 9);
     expect(s.warmup).toBeGreaterThan(0);
     expect(s.warmup).toBeLessThanOrEqual(200);
     expect(s.warmup).toBeCloseTo(Math.min(200, Math.max(...sim.trips.map((t) => t.freeFlowTime))), 9);
     expect(s.throughputPerHour).toBeCloseTo((sim.trips.filter((t) => t.exitT > s.warmup).length / (400 - s.warmup)) * 3600, 6);
-    expect(s.avgTravelTime).toBeCloseTo(total / sim.trips.length, 6);
-    expect(s.avgTripSpeed).toBeCloseTo(sim.trips.reduce((a, t) => a + t.distance, 0) / total, 6);
+    expect(s.avgTravelTime).toBeCloseTo(total / measured.length, 6);
+    expect(s.avgTripSpeed).toBeCloseTo(measured.reduce((a, t) => a + t.distance, 0) / total, 6);
     expect(s.avgDelay).toBeGreaterThan(0);
   });
 

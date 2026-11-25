@@ -8,7 +8,7 @@ describe('free-flow reference and delay', () => {
         const sim = new Simulation({ ...preset(p.id), seed });
         sim.run(900);
         const worst = Math.max(0, ...sim.trips.map((t) => t.freeFlowTime - t.travelTime));
-        expect(worst, `${p.id} seed ${seed}`).toBeLessThan(0.05);
+        expect(worst, `${p.id} seed ${seed}`).toBeLessThan(0.01);
       }
     }
   });
@@ -23,7 +23,7 @@ describe('free-flow reference and delay', () => {
         if (seg.kind === 'connector') worst = Math.max(worst, v.v - (seg as Connector).speedLimit);
       }
     }
-    // Late braking at the comfortable deceleration overshoots by at most a fraction of one step.
+    // The continuous curve limit brings vehicles to the safe speed; discretisation leaves well under 0.5 m/s.
     expect(worst).toBeLessThan(0.5);
   });
 });
@@ -87,5 +87,28 @@ describe('main-road priority at unsignalised junctions', () => {
     expect(sideRate).toBeGreaterThan(20);
     expect(sideRate).toBeLessThan(250);
     expect(sim.invariantViolations()).toEqual([]);
+  });
+});
+
+describe('turns across oncoming traffic at signals', () => {
+  it('give way to oncoming through traffic during the green, so they wait longer than through traffic', () => {
+    for (const seed of [1, 2, 3]) {
+      const sim = new Simulation({ ...preset('four-way'), seed });
+      const movement = new Map<number, Connector>();
+      for (let i = 0; i < 9000; i++) {
+        sim.step();
+        for (const v of sim.vehicles) {
+          const seg = sim.net.segments[v.seg];
+          if (seg.kind === 'connector' && !movement.has(v.id)) movement.set(v.id, seg as Connector);
+        }
+      }
+      // Left-hand traffic: a right turn crosses the oncoming stream.
+      const delay = (turn: string) => {
+        const t = sim.trips.filter((r) => movement.get(r.id)?.turn === turn);
+        return t.reduce((a, r) => a + r.travelTime - r.freeFlowTime, 0) / t.length;
+      };
+      expect(delay('right'), `seed ${seed}`).toBeGreaterThan(delay('straight'));
+      expect(sim.summary().safetyInterventions).toBe(0);
+    }
   });
 });

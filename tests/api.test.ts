@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import worker from '../src/worker/index';
-import { preset } from '../src/engine';
+import { preset, PRESETS } from '../src/engine';
 
 /** In-memory stand-in for a KV namespace: get, put (with metadata) and lexicographic prefix listing. */
 function memoryKv() {
@@ -22,7 +22,8 @@ function memoryKv() {
   };
 }
 
-const env = () => ({ SCENARIOS: memoryKv() }) as never;
+const allow = { limit: async () => ({ success: true }) };
+const env = (limiter = allow) => ({ SCENARIOS: memoryKv(), SIMULATE_LIMIT: limiter, SAVE_LIMIT: limiter }) as never;
 const call = (e: never, path: string, init?: RequestInit) =>
   worker.fetch(new Request(`https://test${path}`, init) as never, e) as Promise<Response>;
 
@@ -67,5 +68,28 @@ describe('backend API', () => {
     expect(a.duration).toBe(120);
     expect(a.summary.spawned).toBeGreaterThan(10);
     expect(a.summary).toEqual(b.summary);
+  });
+
+  it('runs every preset at the maximum duration within the server budget', async () => {
+    for (const p of PRESETS) {
+      const res = await call(env(), '/api/simulate', { method: 'POST', body: JSON.stringify({ scenario: p.build(), duration: 600 }) });
+      expect(res.status, p.id).toBe(200);
+    }
+  });
+
+  it('refuses scenarios too large for the server with a 413 instead of running them', async () => {
+    const nodes = Array.from({ length: 300 }, (_, i) => ({ id: `n${i}`, x: i * 50, y: 0 }));
+    const roads = Array.from({ length: 299 }, (_, i) => ({ id: `r${i}`, from: `n${i}`, to: `n${i + 1}`, lanesFwd: 3, lanesBwd: 3, laneWidth: 3.5, speedLimit: 14 }));
+    const scenario = { nodes, roads, flows: [{ id: 'f', origin: 'n0', destination: 'n299', rate: 3000, mix: { car: 1 } }] };
+    const res = await call(env(), '/api/simulate', { method: 'POST', body: JSON.stringify({ scenario, duration: 600 }) });
+    expect(res.status).toBe(413);
+    expect(((await res.json()) as { error: string }).error).toMatch(/too large/);
+  });
+
+  it('rate-limits simulate and save per client with a 429', async () => {
+    const deny = { limit: async () => ({ success: false }) };
+    const sim = await call(env(deny), '/api/simulate', { method: 'POST', body: JSON.stringify({ scenario: preset('t-junction'), duration: 30 }) });
+    const save = await call(env(deny), '/api/scenarios', { method: 'POST', body: JSON.stringify(preset('t-junction')) });
+    expect([sim.status, save.status]).toEqual([429, 429]);
   });
 });

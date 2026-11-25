@@ -42,3 +42,9 @@ export function roadLabel(sc: Scenario, roadId: string): string {
   const r = sc.roads.find((x) => x.id === roadId);
   return r?.name ? `${r.name} (${r.id})` : (r?.id ?? roadId);
 }
+
+/** "MG Road × Brigade Road (n5)": the distinct names of the roads meeting at a junction. */
+export function junctionLabel(sc: Scenario, nodeId: string): string {
+  const names = [...new Set(sc.roads.filter((r) => r.from === nodeId || r.to === nodeId).map((r) => r.name?.replace(/ (flyover )?ramp$/i, '') ?? r.id))];
+  return `${names.join(' × ')} (${nodeId})`;
+}

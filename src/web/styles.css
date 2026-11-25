@@ -1434,3 +1434,26 @@ input[type='range'] {
     transition: none !important;
   }
 }
+.via {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.via-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 2px 2px 8px;
+  color: var(--text);
+  border: 1px solid var(--line-2);
+}
+.via-chip button.icon {
+  line-height: 16px;
+  font-size: 14px;
+  padding: 0 5px;
+}
+.via select {
+  flex: 1;
+  min-width: 180px;
+}

@@ -52,6 +52,7 @@ function parseShape(raw: unknown): Scenario {
       start: num(x.start ?? 0, 0, 1e9),
       end: num(x.end ?? 1e9, 0, 1e9),
       ...(x.maxVehicles != null ? { maxVehicles: Math.round(num(x.maxVehicles, 0, 1e6)) } : {}),
+      ...(x.via != null ? { via: arr(x.via, `flows[${i}].via`, 8).map((v, k) => str(v, `flows[${i}].via[${k}]`)) } : {}),
     };
   });
   return {
@@ -105,6 +106,11 @@ function checkReferences(sc: Scenario): void {
       if (!nodeIds.has(f.destination)) throw new Error(`${label}: destination ${f.destination} is not a node`);
       if (f.destination === f.origin) throw new Error(`${label}: destination is the same as the origin`);
       if (!endpoint(f.destination, 'out')) throw new Error(`${label}: destination ${f.destination} is not an exit point (a road end with a lane out of the network)`);
+    }
+    for (const [k, via] of (f.via ?? []).entries()) {
+      if (!nodeIds.has(via)) throw new Error(`${label}: via point ${via} is not a node`);
+      if ((roadsAt.get(via)?.length ?? 0) < 2) throw new Error(`${label}: via point ${via} is not a junction (it must be where roads meet)`);
+      if (k > 0 && f.via![k - 1] === via) throw new Error(`${label}: via point ${via} is listed twice in a row`);
     }
     if (f.mix.car + f.mix.bus + f.mix.bike + f.mix.truck <= 0) throw new Error(`${label}: vehicle mix is empty`);
     if (f.end < f.start) throw new Error(`${label}: ends before it starts`);

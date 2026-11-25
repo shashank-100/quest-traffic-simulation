@@ -13,6 +13,9 @@ export default defineConfig({
     },
     env: {
       SCENARIOS: bindings.kv(),
+      // Per-client request limits for the two endpoints that do real work.
+      SIMULATE_LIMIT: bindings.rateLimit({ namespace: '1001', simple: { limit: 20, period: 60 } }),
+      SAVE_LIMIT: bindings.rateLimit({ namespace: '1002', simple: { limit: 30, period: 60 } }),
     },
   },
 });

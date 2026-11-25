@@ -92,3 +92,26 @@ export function reachableExits(net: Network, fromEdge: number): string[] {
   }
   return [...exits].sort();
 }
+
+/**
+ * Shortest route from `fromEdge` through each node of `via` in order, ending at `destNode` (or at
+ * the last via node when destNode is null). Each leg is a shortest path from the end of the
+ * previous one. Returns null when any leg is impossible.
+ */
+export function shortestRouteVia(net: Network, fromEdge: number, via: readonly string[], destNode: string | null, cost: EdgeCost): number[] | null {
+  let route = [fromEdge];
+  for (const target of destNode === null ? via : [...via, destNode]) {
+    const leg = shortestRoute(net, route[route.length - 1], target, cost);
+    if (!leg) return null;
+    route = [...route, ...leg.slice(1)];
+  }
+  return route;
+}
+
+/** How many of `via` (in order) the edges route[0..upTo] have already reached. */
+export function viaReached(net: Network, route: readonly number[], upTo: number, via: readonly string[]): number {
+  let k = 0;
+  for (let i = 0; i <= upTo && i < route.length && k < via.length; i++) if (net.edges[route[i]].to === via[k]) k++;
+  return k;
+}
+

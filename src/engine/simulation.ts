@@ -1,6 +1,6 @@
-import { buildNetwork, segmentLevel, type Connector, type Lane, type Network, type Segment } from './network';
+import { buildNetwork, segmentLevel, type CompiledNode, type Connector, type Lane, type Network, type Segment } from './network';
 import { Rng } from './rng';
-import { freeFlowCost, reachableExits, shortestRoute, type EdgeCost } from './routing';
+import { freeFlowCost, reachableExits, shortestRoute, shortestRouteVia, viaReached, type EdgeCost } from './routing';
 import { lightFor, signalStatus, type LightState } from './signals';
 import { idmAccel, laneWidthEffect, VEHICLE_PARAMS, type LaneEffect, type VehicleParams } from './vehicles';
 import { rightNormal, scale, norm, sub } from './geometry';
@@ -12,32 +12,30 @@ const LANE_CHANGE_EVERY = 5; // steps
 const MOBIL_THRESHOLD = 0.25;
 const SAFE_DECEL = 4;
 const QUEUE_SPEED = 2; // m/s below which a vehicle counts as queued
-/**
- * How the junction curves ahead constrain a vehicle travelling at `speed`, given its comfortable
- * deceleration. `upcoming` lists the movements ahead with their distance from the front bumper.
- *  - cap: the fastest it may go now and still brake at `decel` to every curve's safe speed in time,
- *    min over curves of √(limit² + 2·decel·distance). It rises with distance, so a vehicle speeds
- *    up between curves. Used as a ceiling on its desired speed.
- *  - brake: once it is at or above that cap, the deceleration that brings it to the curve's safe
- *    speed exactly at the curve (≈ decel on the boundary), so it brakes late and smoothly and never
- *    enters a curve too fast. Infinity when no curve requires braking yet.
- * Shared by the simulation and the free-flow reference so both take curves identically.
- */
 /** Fraction (0–1] of a step's displacement `ds` covered before crossing a line it overshot by `over`. */
 function exitFraction(over: number, ds: number): number {
   return ds > 0 ? Math.min(1, Math.max(0, 1 - over / ds)) : 1;
 }
 
-export function curvePlan(speed: number, decel: number, upcoming: Iterable<{ dist: number; limit: number }>): { cap: number; brake: number } {
-  let cap = Infinity;
-  let brake = Infinity;
+/**
+ * Acceleration limit from the junction curves ahead, for a vehicle at `speed` with maximum
+ * acceleration `accel` and comfortable deceleration `decel`. For each curve the vehicle must slow
+ * for, r = (speed² − limit²) / (2·distance) is the deceleration that would bring it to the curve's
+ * safe speed exactly at the curve. The limit is accel − r·(1 + accel/decel): full acceleration
+ * while no slowing is needed (r = 0), tapering continuously to zero and then to braking at exactly
+ * `decel` when r reaches it, and harder beyond. Being continuous in speed and distance, vehicles
+ * ease off before braking (as drivers do), never crawl between curves, and arrive at each curve at
+ * its safe speed. `upcoming` lists the movements ahead with their distance from the front bumper.
+ * Shared by the simulation and the free-flow reference so both take curves identically.
+ */
+export function curveAccelLimit(speed: number, accel: number, decel: number, upcoming: Iterable<{ dist: number; limit: number }>): number {
+  let bound = Infinity;
   for (const { dist, limit } of upcoming) {
-    const d = Math.max(0, dist);
-    const c = Math.sqrt(limit * limit + 2 * decel * d);
-    cap = Math.min(cap, c);
-    if (speed >= c && speed > limit) brake = Math.min(brake, (limit * limit - speed * speed) / (2 * Math.max(1, d)));
+    if (speed <= limit) continue;
+    const r = (speed * speed - limit * limit) / (2 * Math.max(0.5, dist));
+    bound = Math.min(bound, accel - r * (1 + accel / decel));
   }
-  return { cap, brake };
+  return bound;
 }
 
 /**
@@ -61,6 +59,8 @@ export interface Vehicle {
   v: number;
   acc: number;
   route: number[];
+  /** Junctions this vehicle must still pass through in order (its flow's via-points). */
+  via: string[];
   /** Index into route of the edge being driven (or being left, while on a connector). */
   ri: number;
   dest: string;
@@ -102,6 +102,7 @@ export interface Sample {
   exited: number;
   queued: number;
   queueLength: number; // total metres of queues at junction approaches
+  maxLaneQueue: number; // longest single-lane queue (m)
   backlog: number;
   density: number; // network-wide veh/km/lane
 }
@@ -127,11 +128,13 @@ export interface Summary {
   /** Steady-state exit rate: trips completed after the warm-up, per hour of measurement. */
   throughputPerHour: number;
   /**
-   * Seconds discarded before measuring throughput: the longest free-flow trip time among completed
-   * trips (by then vehicles that entered at the start have had time to cross the longest route),
-   * capped at half the run so there is always a measurement window.
+   * Seconds discarded before measuring: the longest free-flow trip time among completed trips (by
+   * then vehicles that entered at the start have had time to cross the longest route), capped at
+   * half the run so there is always a measurement window.
    */
   warmup: number;
+  /** Trips that entered after the warm-up and have completed: the basis of the trip averages. */
+  measuredTrips: number;
   avgQueueLength: number;
   maxQueueLength: number;
   avgDensity: number;
@@ -160,8 +163,6 @@ export class Simulation {
   occ: Vehicle[][];
   /** Vehicles that entered each junction (node id → count). */
   nodeThroughput = new Map<string, number>();
-  /** Running max queue length per lane id. */
-  maxQueueByLane = new Map<number, number>();
   spawned = 0;
   laneChangeCount = 0;
   unroutable = 0;
@@ -307,29 +308,36 @@ export class Simulation {
     return this.queueByLane.get(laneId) ?? 0;
   }
 
+  /**
+   * Performance summary. Everything is measured after the warm-up (see Summary.warmup), when the
+   * network has filled: trip averages over trips that entered after it, time averages over samples
+   * taken after it. Counts (spawned, completed, active, backlog) cover the whole run.
+   */
   summary(): Summary {
-    const done = this.trips;
+    const all = this.trips;
+    const warmup = Math.min(this.t / 2, all.reduce((a, r) => Math.max(a, r.freeFlowTime), 0));
+    const done = all.filter((r) => r.exitT - r.travelTime >= warmup);
     const n = done.length;
     const sum = (f: (r: TripRecord) => number) => done.reduce((a, r) => a + f(r), 0);
     const totalTime = sum((r) => r.travelTime);
-    const samples = this.samples;
+    const samples = this.samples.filter((s) => s.t > warmup);
     const avg = (f: (s: Sample) => number) => (samples.length ? samples.reduce((a, s) => a + f(s), 0) / samples.length : 0);
     const speedSamples = samples.filter((s) => s.active > 0);
-    const warmup = Math.min(this.t / 2, done.reduce((a, r) => Math.max(a, r.freeFlowTime), 0));
     return {
       simTime: this.t,
       spawned: this.spawned,
-      completed: n,
+      completed: all.length,
       active: this.vehicles.length,
       backlog: this.backlogCount(),
       avgTravelTime: n ? totalTime / n : 0,
       avgDelay: n ? sum((r) => Math.max(0, r.travelTime - r.freeFlowTime)) / n : 0,
       avgTripSpeed: totalTime > 0 ? sum((r) => r.distance) / totalTime : 0,
       avgSpeed: speedSamples.length ? speedSamples.reduce((a, s) => a + s.meanSpeed, 0) / speedSamples.length : 0,
-      throughputPerHour: this.t > warmup ? (done.filter((r) => r.exitT > warmup).length / (this.t - warmup)) * 3600 : 0,
+      throughputPerHour: this.t > warmup ? (all.filter((r) => r.exitT > warmup).length / (this.t - warmup)) * 3600 : 0,
       warmup,
+      measuredTrips: n,
       avgQueueLength: avg((s) => s.queueLength),
-      maxQueueLength: Math.max(0, ...this.maxQueueByLane.values()),
+      maxQueueLength: Math.max(0, ...samples.map((s) => s.maxLaneQueue)),
       avgDensity: avg((s) => s.density),
       stopsShare: totalTime > 0 ? sum((r) => r.stoppedTime) / totalTime : 0,
       unroutable: this.unroutable,
@@ -385,10 +393,17 @@ export class Simulation {
 
   // ---------------------------------------------------------------- demand
 
-  private routeFor(entryEdge: number, dest: string): number[] | null {
-    const key = `${entryEdge}>${dest}`;
-    if (!this.routeCache.has(key)) this.routeCache.set(key, shortestRoute(this.net, entryEdge, dest, this.cost));
+  private routeFor(entryEdge: number, dest: string, via: readonly string[]): number[] | null {
+    const key = `${entryEdge}>${via.join('>')}>${dest}`;
+    if (!this.routeCache.has(key)) this.routeCache.set(key, shortestRouteVia(this.net, entryEdge, via, dest, this.cost));
     return this.routeCache.get(key)!;
+  }
+
+  /** Exits reachable from an entry edge after passing the via-points (excluding the origin itself). */
+  private exitsAfter(entryEdge: number, via: readonly string[], origin: string): string[] {
+    const prefix = via.length ? shortestRouteVia(this.net, entryEdge, via, null, this.cost) : [entryEdge];
+    if (!prefix) return [];
+    return reachableExits(this.net, prefix[prefix.length - 1]).filter((x) => x !== origin);
   }
 
   private spawn(): void {
@@ -398,7 +413,7 @@ export class Simulation {
         const type = this.rng.pickWeighted(['car', 'bus', 'bike', 'truck'] as const, (k) => d.mix[k]) ?? 'car';
         let dest = d.destination;
         if (!dest && f.entryEdge !== null) {
-          const exits = reachableExits(this.net, f.entryEdge).filter((x) => x !== d.origin);
+          const exits = this.exitsAfter(f.entryEdge, d.via ?? [], d.origin);
           dest = exits.length ? exits[this.rng.int(exits.length)] : null;
         }
         f.backlog.push({ type, dest, requestT: f.nextT });
@@ -417,7 +432,7 @@ export class Simulation {
   private tryInsert(f: FlowState, entry: number): void {
     const spec = f.backlog[0];
     const dest = spec.dest;
-    const route = dest ? this.routeFor(entry, dest) : null;
+    const route = dest ? this.routeFor(entry, dest, f.def.via ?? []) : null;
     if (!route || !dest) {
       f.backlog.shift();
       this.unroutable++;
@@ -465,6 +480,7 @@ export class Simulation {
       v,
       acc: 0,
       route,
+      via: f.def.via ?? [],
       ri: 0,
       dest,
       flowId: f.def.id,
@@ -513,8 +529,8 @@ export class Simulation {
     for (let steps = 0; ; steps++) {
       const seg = this.net.segments[path[k]];
       // Same acceleration as accelFor() with nothing ahead: free-road IDM towards the same desired
-      // speed (lane-width effect, speed limit and curve speed cap over the same LOOKAHEAD), and the
-      // same gradient limit.
+      // speed (lane-width effect and speed limit), the same curve limit over the same LOOKAHEAD, and
+      // the same gradient limit.
       const curves: { dist: number; limit: number }[] = [];
       let dist = seg.length - s;
       for (let j = k + 1; j < path.length && dist < LOOKAHEAD; j++) {
@@ -522,9 +538,8 @@ export class Simulation {
         if (next.kind === 'connector') curves.push({ dist, limit: next.speedLimit });
         dist += next.length;
       }
-      const plan = curvePlan(v, p.decel, curves);
-      const desired = Math.min(v0 * this.laneEffect[seg.id][type].speed, seg.speedLimit, plan.cap);
-      let a = Math.min(idmAccel(p, v, desired, Infinity, 0), plan.brake);
+      const desired = Math.min(v0 * this.laneEffect[seg.id][type].speed, seg.speedLimit);
+      let a = Math.min(idmAccel(p, v, desired, Infinity, 0), curveAccelLimit(v, p.accel, p.decel, curves));
       a = Math.max(-p.maxDecel, Math.min(Math.max(0.05, p.accel - G * this.grade[seg.id]), a));
       const nv = v + a * DT;
       let ds: number;
@@ -576,10 +591,11 @@ export class Simulation {
    * Whether the light lets a vehicle `distance` from the stop line enter (or keep its grant).
    *  - Green: yes.
    *  - Yellow: only if it is sure to reach the stop line before the yellow ends. Until the line it
-   *    only slows for the curves it is planning for, and the curve speed cap never falls below a
+   *    only slows for the curves it is planning for, and the curve limit never slows it below a
    *    curve's safe speed, so its speed stays at or above min(current speed, the lowest safe speed
-   *    among those curves); distance / that floor bounds its arrival time. Anyone refused is still
-   *    far enough back to stop.
+   *    among those curves); distance / that floor bounds its arrival time. A vehicle waiting at the
+   *    line (such as a turner that found no gap during the green) may clear on yellow if it can
+   *    cross the line in time. Anyone refused can still stop.
    *  - Red: no; a grant issued earlier is withdrawn.
    * A grant is never withdrawn from a vehicle that can no longer stop before the line even at its
    * braking limit: pulling it then would leave it stranded in the junction mouth.
@@ -590,7 +606,10 @@ export class Simulation {
     if (light === 'red') return false;
     let floor = v.v;
     for (const c of this.upcomingCurves(v)) floor = Math.min(floor, c.limit);
-    return distance <= floor * yellowLeft;
+    // A vehicle (nearly) at rest at the line, typically a turner that waited for a gap, is bounded
+    // instead by accelerating at no less than half its maximum: √(4·distance / a_max).
+    const arrival = Math.min(floor > 0 ? distance / floor : Infinity, Math.sqrt((4 * distance) / v.p.accel));
+    return arrival <= yellowLeft;
   }
 
   /** Free room at the start of a lane, in metres. Moving tails count as room since they clear ahead of us. */
@@ -671,9 +690,9 @@ export class Simulation {
     }
     for (const [nodeId, cands] of byNode) {
       // On a main road with priority, main-road traffic is served first; side roads then yield.
-      const major = this.net.nodes.get(nodeId)!.majorRoads;
-      const onMajor = (c: Cand) => major.has((this.net.segments[c.c.fromLane] as Lane).roadId);
-      cands.sort((a, b) => Number(onMajor(b)) - Number(onMajor(a)) || a.v.requestT - b.v.requestT || a.v.id - b.v.id);
+      // Higher-ranked movements (main road, then straight-on and kerb-side turns) are served first.
+      const node = this.net.nodes.get(nodeId)!;
+      cands.sort((a, b) => this.movementRank(node, b.c) - this.movementRank(node, a.c) || a.v.requestT - b.v.requestT || a.v.id - b.v.id);
       const busy = busyByNode.get(nodeId) ?? new Set<number>();
       const reserved = new Set<number>();
       for (const { v, c, pred } of cands) {
@@ -682,7 +701,7 @@ export class Simulation {
           c.conflicts.some((k) => busy.has(k) || reserved.has(k)) ||
           c.merges.some((k) => reserved.has(k)) ||
           !this.mergeClear(v, c, usersOf) ||
-          (major.size > 0 && !major.has((this.net.segments[c.fromLane] as Lane).roadId) && !this.mainRoadGap(v, c, major));
+          !this.priorityGap(v, c, node);
         if (blocked) {
           reserved.add(c.id);
           continue;
@@ -699,34 +718,59 @@ export class Simulation {
     }
   }
 
-  /**
-   * Critical gap (s) a side-road vehicle needs before entering across or into main-road traffic:
-   * HCM base critical headways for a two-way-stop-controlled junction on a two-lane main road —
-   * 6.2 s for a kerb-side turn, 6.5 s straight across, 7.1 s for a turn across oncoming traffic.
-   */
-  private criticalGap(c: Connector): number {
-    if (c.turn === 'straight') return 6.5;
-    const kerbSide = (c.turn === 'left') === (this.scenario.driveSide === 'left');
-    return kerbSide ? 6.2 : 7.1;
+  /** Whether a movement turns across the opposing traffic stream (a right turn when driving on the left). */
+  private crossesOncoming(c: Connector): boolean {
+    return c.turn !== 'straight' && (c.turn === 'right') === (this.scenario.driveSide === 'left');
   }
 
   /**
-   * Gap acceptance for a side-road vehicle v wanting movement c at a junction with a main road.
-   * The critical gap is a headway between successive conflicting main-road vehicles, so the gap
-   * that "now" falls in runs from the last conflicting main-road vehicle entering the junction to
-   * the next one reaching its stop line. v may enter when that gap is at least c's critical gap and
-   * the next main-road vehicle arrives no sooner than v needs to drive clear of the junction. (A
-   * vehicle already granted or inside the junction is covered by the conflict and merge checks.)
+   * Right-of-way rank of a movement at an intersection (higher goes first):
+   *  - main-road movements outrank side-road movements (unsignalised junctions with a main road);
+   *  - within a road level, straight-on and kerb-side turns outrank turns across oncoming traffic,
+   *    wherever there is a priority order at all (signalised, or unsignalised with a main road).
+   * Symmetric unsignalised junctions have no order: every movement ranks the same (first come,
+   * first served).
    */
-  private mainRoadGap(v: Vehicle, c: Connector, major: Set<string>): boolean {
-    const critical = this.criticalGap(c);
-    const node = this.net.nodes.get(c.node)!;
-    const interacts = (k: number) => c.conflicts.includes(k) || c.merges.includes(k);
+  private movementRank(node: CompiledNode, c: Connector): number {
+    const ordered = node.signal !== null || node.majorRoads.size > 0;
+    if (!ordered) return 0;
+    const road = node.majorRoads.has((this.net.segments[c.fromLane] as Lane).roadId) ? 2 : 0;
+    return road + (this.crossesOncoming(c) ? 0 : 1);
+  }
+
+  /**
+   * Critical gap (s) for a movement that gives way. Side-road traffic giving way to a main road uses
+   * the HCM base critical headways for two-way stop control on a two-lane main road (6.2 s
+   * kerb-side turn, 6.5 s straight across, 7.1 s across traffic). A turn across oncoming traffic
+   * within its own road level uses the HCM permitted-turn values: 4.5 s at a signal, 4.1 s for a
+   * main-road turn at an unsignalised junction.
+   */
+  private criticalGap(node: CompiledNode, c: Connector): number {
+    const sideRoad = node.majorRoads.size > 0 && !node.majorRoads.has((this.net.segments[c.fromLane] as Lane).roadId);
+    if (sideRoad) return c.turn === 'straight' ? 6.5 : this.crossesOncoming(c) ? 7.1 : 6.2;
+    return node.signal ? 4.5 : 4.1;
+  }
+
+  /**
+   * Gap acceptance against higher-ranked traffic. The streams v must give way to are the movements
+   * from other approaches that rank above c, cross or merge with it, and may currently move (not
+   * held by a red). A critical gap is a headway between successive vehicles of those streams, so
+   * the gap "now" falls in runs from the last such vehicle entering the junction to the next one
+   * reaching its stop line. v may enter when that gap is at least its critical gap and the next one
+   * arrives no sooner than v needs to drive clear of the junction. (Vehicles already granted or in
+   * the junction are covered by the conflict and merge checks.)
+   */
+  private priorityGap(v: Vehicle, c: Connector, node: CompiledNode): boolean {
+    const rank = this.movementRank(node, c);
+    const interacts = (k: number) => this.movementRank(node, this.net.segments[k] as Connector) > rank && (c.conflicts.includes(k) || c.merges.includes(k));
+    if (!c.conflicts.some(interacts) && !c.merges.some(interacts)) return true;
+    const critical = this.criticalGap(node, c);
     let last = -Infinity;
     let next = Infinity;
     for (const eid of node.inEdges) {
+      if (eid === c.fromEdge) continue;
       const edge = this.net.edges[eid];
-      if (!major.has(edge.roadId)) continue;
+      if (node.signal && lightFor(node, edge.roadId, this.t) === 'red') continue;
       for (const lid of edge.lanes) {
         const lane = this.net.segments[lid] as Lane;
         for (const k of lane.connectorsOut) if (interacts(k)) last = Math.max(last, this.lastEntry[k]);
@@ -741,7 +785,7 @@ export class Simulation {
         }
       }
     }
-    if (!Number.isFinite(next)) return true; // no conflicting arrival within the critical gap
+    if (!Number.isFinite(next)) return true; // no higher-ranked arrival within the critical gap
     const gap = this.t - last + next;
     const lane = this.net.segments[v.seg];
     const clear = lane.length - v.s + c.length + v.p.length;
@@ -922,9 +966,10 @@ export class Simulation {
 
   private accelFor(v: Vehicle): number {
     const ob = this.obstacleAhead(v);
-    const curves = curvePlan(v.v, v.p.decel, this.upcomingCurves(v));
-    const v0 = Math.min(this.desiredSpeed(v, v.seg), curves.cap);
-    const a = Math.min(idmAccel(v.p, v.v, v0, ob.gap, ob.dv, this.headwayOn(v, v.seg)), curves.brake);
+    const a = Math.min(
+      idmAccel(v.p, v.v, this.desiredSpeed(v, v.seg), ob.gap, ob.dv, this.headwayOn(v, v.seg)),
+      curveAccelLimit(v.v, v.p.accel, v.p.decel, this.upcomingCurves(v)),
+    );
     // Climbing a ramp costs g·sinθ of the available acceleration (heavy vehicles feel it most).
     const maxAccel = Math.max(0.05, v.p.accel - G * this.grade[v.seg]);
     return Math.max(-v.p.maxDecel, Math.min(maxAccel, a));
@@ -1051,10 +1096,12 @@ export class Simulation {
   }
 
   private reroute(v: Vehicle, lane: Lane): void {
+    // Keep the via-points it has not yet passed.
+    const remaining = v.via.slice(viaReached(this.net, v.route, v.ri, v.via));
     let best: number[] | null = null;
     for (const cid of lane.connectorsOut) {
       const c = this.net.segments[cid] as Connector;
-      const tail = shortestRoute(this.net, c.toEdge, v.dest, this.cost);
+      const tail = shortestRouteVia(this.net, c.toEdge, remaining, v.dest, this.cost);
       if (tail && (!best || tail.length < best.length)) best = tail;
     }
     if (!best && lane.connectorsOut.length) {
@@ -1205,7 +1252,6 @@ export class Simulation {
       }
       if (q > 0) {
         this.queueByLane.set(lane.id, q);
-        this.maxQueueByLane.set(lane.id, Math.max(this.maxQueueByLane.get(lane.id) ?? 0, q));
         total += q;
       }
     }
@@ -1231,6 +1277,7 @@ export class Simulation {
       exited: this.trips.length,
       queued,
       queueLength,
+      maxLaneQueue: Math.max(0, ...this.queueByLane.values()),
       backlog: this.backlogCount(),
       density: laneKm > 0 ? this.vehicles.length / laneKm : 0,
     });

@@ -13,14 +13,19 @@ describe('junction rules', () => {
     });
   }
 
-  it('unsignalised T-junction serves the side street (no starvation)', () => {
-    const sc = preset('t-junction');
-    const sim = new Simulation(sc);
-    sim.run(600);
-    const side = sc.flows[2].id;
-    const sideTrips = sim.trips.filter((t) => t.flowId === side);
-    expect(sideTrips.length).toBeGreaterThan(20);
-    expect(Math.max(...sideTrips.map((t) => t.travelTime))).toBeLessThan(150);
+  it('unsignalised T-junction serves the side street at its demand (no starvation)', () => {
+    for (const seed of [1, 2, 3, 42]) {
+      const sc = { ...preset('t-junction'), seed };
+      const sim = new Simulation(sc);
+      sim.run(900);
+      const side = sc.flows[2];
+      const served = sim.trips.filter((t) => t.flowId === side.id).length;
+      const waiting = sim.vehicles.filter((v) => v.flowId === side.id).length + sim.backlogCount();
+      // Side-road traffic gives way, but it must keep flowing: most of its demand is served and no
+      // queue builds up without bound.
+      expect(served, `seed ${seed}`).toBeGreaterThan(((side.rate * 900) / 3600) * 0.6);
+      expect(waiting, `seed ${seed}`).toBeLessThan(15);
+    }
   });
 
   it('does not gridlock: under sustained demand every preset keeps discharging', () => {

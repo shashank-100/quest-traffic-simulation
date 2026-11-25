@@ -1,5 +1,16 @@
-import { endpointRoles, VEHICLE_TYPES, type FlowDef, type Scenario, type Simulation, type VehicleType } from '../engine';
+import { endpointRoles, freeFlowCost, reachableExits, shortestRouteVia, VEHICLE_TYPES, type FlowDef, type Network, type Scenario, type Simulation, type VehicleType } from '../engine';
+import { junctionLabel } from './format';
 import { Field, Section, Slider } from './ui';
+
+/** Whether vehicles of this flow can actually drive from its origin through its via points to an exit. */
+function flowRoutable(net: Network, f: FlowDef): boolean {
+  const entry = net.entryEdges.find((e) => net.edges[e].from === f.origin);
+  if (entry === undefined) return false;
+  const via = f.via ?? [];
+  const route = shortestRouteVia(net, entry, via, f.destination, freeFlowCost(net));
+  if (!route) return false;
+  return f.destination !== null || reachableExits(net, route[route.length - 1]).some((x) => x !== f.origin);
+}
 
 interface Props {
   sim: Simulation;
@@ -12,6 +23,7 @@ const TYPE_LABEL: Record<VehicleType, string> = { car: 'Cars', bike: 'Two-wheele
 
 export function TrafficPanel({ sim, scenario, labels, onEdit }: Props) {
   const roles = endpointRoles(scenario);
+  const junctions = [...sim.net.nodes.values()].filter((n) => n.degree >= 2).map((n) => n.id);
   const entries = [...labels.entries()].filter(([id]) => roles.get(id)?.entry);
   const exits = [...labels.entries()].filter(([id]) => roles.get(id)?.exit);
   const setFlow = (id: string, patch: Partial<FlowDef>) =>
@@ -109,6 +121,38 @@ export function TrafficPanel({ sim, scenario, labels, onEdit }: Props) {
                   </select>
                 </Field>
               </div>
+              <Field label="Via" hint="junctions to pass, in order">
+                <div className="via">
+                  {(f.via ?? []).map((n, k) => (
+                    <span className="chip via-chip" key={`${n}-${k}`}>
+                      {k + 1}. {junctionLabel(scenario, n)}
+                      <button
+                        type="button"
+                        className="icon"
+                        aria-label={`Remove via point ${junctionLabel(scenario, n)}`}
+                        onClick={() => setFlow(f.id, { via: (f.via ?? []).filter((_, i) => i !== k) })}
+                      >
+                        ×
+                      </button>
+                    </span>
+                  ))}
+                  <select
+                    value=""
+                    aria-label="Add a via point"
+                    onChange={(e) => e.target.value && setFlow(f.id, { via: [...(f.via ?? []), e.target.value] })}
+                  >
+                    <option value="">{f.via?.length ? '+ add another junction' : 'Shortest route (add a junction to pass through)'}</option>
+                    {junctions
+                      .filter((n) => n !== f.via?.[f.via.length - 1])
+                      .map((n) => (
+                        <option key={n} value={n}>
+                          {junctionLabel(scenario, n)}
+                        </option>
+                      ))}
+                  </select>
+                </div>
+              </Field>
+              {!flowRoutable(sim.net, f) && <p className="error">No route from this origin passes these via points in this order to {f.destination ? 'this destination' : 'an exit'}.</p>}
               <Field label="Entry rate" hint="Poisson arrivals">
                 <Slider label="Entry rate" value={f.rate} min={0} max={3000} step={20} format={(v) => `${v} veh/h`} onChange={(v) => setFlow(f.id, { rate: v })} />
               </Field>

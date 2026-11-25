@@ -21,11 +21,16 @@ export function Analytics({ sim }: { sim: Simulation }) {
         <Kpi label="Mean speed now" value={fmt(kmh(live))} unit="km/h" />
         <Kpi label="Avg travel time" value={s.completed ? fmt(s.avgTravelTime, 1) : '—'} unit="s" />
         <Kpi label="Avg delay" value={s.completed ? fmt(s.avgDelay, 1) : '—'} unit="s/veh" tone={s.avgDelay > 45 ? 'bad' : s.avgDelay > 15 ? 'warn' : undefined} />
-        <Kpi label={s.warmup > 0 ? `Throughput · after ${fmt(s.warmup)} s warm-up` : 'Throughput'} value={fmt(s.throughputPerHour)} unit="veh/h" />
+        <Kpi label="Throughput" value={fmt(s.throughputPerHour)} unit="veh/h" />
         <Kpi label="Queued now" value={fmt(last?.queueLength ?? 0)} unit="m" tone={(last?.queueLength ?? 0) > 150 ? 'bad' : undefined} />
         <Kpi label="Density" value={fmt(last?.density ?? 0, 1)} unit="veh/km/ln" />
         <Kpi label="Waiting to enter" value={fmt(s.backlog)} tone={s.backlog > 10 ? 'bad' : undefined} />
       </div>
+      {s.warmup > 0 && (
+        <p className="note">
+          Travel time, delay and throughput exclude the first {fmt(s.warmup)} s while the network fills (warm-up): {s.measuredTrips} of {s.completed} completed trips are measured.
+        </p>
+      )}
       <Section title="Over time">
         {samples.length < 2 ? (
           <p className="note">Press play to collect data. One sample per simulated second.</p>
