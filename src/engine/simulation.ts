@@ -431,7 +431,7 @@ export class Simulation {
       spawnT: this.t,
       entryWait: this.t - spec.requestT,
       dist: 0,
-      freeFlowTime: this.freeFlowTime(route, v0, spec.type),
+      freeFlowTime: this.soloTravelTime(route, best.lane.id, v, v0, spec.type),
       grant: null,
       occupying: null,
       requestT: -1,
@@ -447,26 +447,62 @@ export class Simulation {
   }
 
   /**
-   * Time to drive a route alone at the driver's desired speed: every edge, plus the junction
-   * movement between consecutive edges, each at its own speed limit and lane-width effect.
+   * Free-flow reference for delay: the time this same driver (type, desired speed, entry lane and
+   * speed) would take to drive its route alone. It is computed with the engine's own longitudinal
+   * model, stepped exactly like the simulation, so it includes everything a lone vehicle really
+   * does: lane-width speed effects, slowing for junction curves and accelerating back out, and
+   * reduced acceleration on ramps. Without other traffic there are no leaders, stop lines or
+   * waits; a lane change (if the route needs one) is lateral and does not change progress.
    */
-  private freeFlowTime(route: number[], v0: number, type: VehicleType): number {
-    let t = 0;
-    for (let i = 0; i < route.length; i++) {
-      const edge = this.net.edges[route[i]];
-      const lane = edge.lanes[0];
-      t += edge.length / Math.min(v0 * this.laneEffect[lane][type].speed, edge.speedLimit);
-      if (i + 1 === route.length) continue;
-      let best = Infinity;
-      for (const lid of edge.lanes) {
-        for (const cid of (this.net.segments[lid] as Lane).connectorsOut) {
-          const c = this.net.segments[cid] as Connector;
-          if (c.toEdge === route[i + 1]) best = Math.min(best, c.length / Math.min(v0 * this.laneEffect[cid][type].speed, c.speedLimit));
-        }
-      }
-      t += best;
+  private soloTravelTime(route: number[], startLane: number, startSpeed: number, v0: number, type: VehicleType): number {
+    const p = VEHICLE_PARAMS[type];
+    // The segments this vehicle drives: its lanes along the route and the movements between them.
+    const path: number[] = [startLane];
+    let lane = startLane;
+    for (let i = 0; i + 1 < route.length; i++) {
+      const pick = (lid: number) => (this.net.segments[lid] as Lane).connectorsOut.find((c) => (this.net.segments[c] as Connector).toEdge === route[i + 1]);
+      let cid = pick(lane);
+      if (cid === undefined) for (const lid of this.net.edges[route[i]].lanes) cid ??= pick(lid);
+      const c = this.net.segments[cid!] as Connector;
+      path.push(c.id, c.toLane);
+      lane = c.toLane;
     }
-    return t;
+    let k = 0;
+    let s = 0;
+    let v = startSpeed;
+    for (let steps = 0; ; steps++) {
+      const seg = this.net.segments[path[k]];
+      // Same acceleration as accelFor() with nothing ahead: free-road IDM, curve slowing, gradient.
+      // Curves are seen exactly as obstacleAhead() sees them: through simple connections, and into
+      // an intersection only from the vehicle's own lane once inside its request zone (where a
+      // lone vehicle is granted at once).
+      let a = idmAccel(p, v, Math.min(v0 * this.laneEffect[seg.id][type].speed, seg.speedLimit), Infinity, 0);
+      let dist = seg.length - s;
+      for (let j = k + 1; j < path.length && dist < LOOKAHEAD; j++) {
+        const next = this.net.segments[path[j]];
+        if (next.kind === 'connector') {
+          const granted = j - 1 === k && dist <= this.requestZone({ v, p });
+          if (this.net.nodes.get(next.node)!.control === 'intersection' && !granted) break;
+          if (v > next.speedLimit) a = Math.min(a, (next.speedLimit ** 2 - v ** 2) / (2 * Math.max(1, dist)));
+        }
+        dist += next.length;
+      }
+      a = Math.max(-p.maxDecel, Math.min(Math.max(0.05, p.accel - G * this.grade[seg.id]), a));
+      const nv = v + a * DT;
+      if (nv < 0) {
+        s += a < 0 ? -(v * v) / (2 * a) : 0;
+        v = 0;
+      } else {
+        s += v * DT + 0.5 * a * DT * DT;
+        v = nv;
+      }
+      while (s >= this.net.segments[path[k]].length) {
+        // Exits on the step it passes the end of its last lane; the entry step counts as time zero.
+        if (k === path.length - 1) return steps * DT;
+        s -= this.net.segments[path[k]].length;
+        k++;
+      }
+    }
   }
 
   // ---------------------------------------------------------------- junctions
@@ -491,7 +527,7 @@ export class Simulation {
    * plus one desired time headway of reaction, plus the 20 m it needs to come to rest smoothly with
    * IDM (so that, at green, it is granted before the stop line ever influences it).
    */
-  private requestZone(v: Vehicle): number {
+  private requestZone(v: Pick<Vehicle, 'v' | 'p'>): number {
     return Math.max(30, (v.v * v.v) / (2 * v.p.decel) + v.v * v.p.headway + 20);
   }
 

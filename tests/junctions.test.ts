@@ -81,11 +81,10 @@ describe('simple connections versus intersections', () => {
     expect(sim.summary().safetyInterventions).toBe(0);
   });
 
-  it('a lone vehicle drives through connections and an empty intersection without braking or delay', () => {
+  it('a lone vehicle drives straight through connections and an empty intersection without braking', () => {
     for (const id of ['crossing-flyover', 'crossing-at-grade']) {
       const sc = preset(id);
       for (const f of sc.flows) {
-        // No signal, no other traffic: any braking or delay would come from the control logic itself.
         const lone = { ...sc, nodes: sc.nodes.map((n) => ({ ...n, signal: undefined })), flows: [{ ...f, rate: 3600, maxVehicles: 1, mix: { car: 1, bus: 0, bike: 0, truck: 0 } }] };
         const sim = new Simulation(lone);
         let braked = false;
@@ -93,9 +92,32 @@ describe('simple connections versus intersections', () => {
           sim.step();
           for (const v of sim.vehicles) if (v.acc < -1e-6) braked = true;
         }
-        const t = sim.trips[0];
         expect(braked, `${id} ${f.name}`).toBe(false);
-        expect(Math.abs(t.travelTime - t.freeFlowTime), `${id} ${f.name}`).toBeLessThan(0.1); // one time step
+      }
+    }
+  });
+
+  it('a lone vehicle has zero delay on every route, straight or turning, for every vehicle type', () => {
+    for (const id of ['four-way', 't-junction', 'crossing-at-grade', 'crossing-flyover']) {
+      const sc = preset(id);
+      const ends = [...new Simulation(sc).net.nodes.values()].filter((n) => n.isEndpoint).map((n) => n.id);
+      for (const o of ends) {
+        for (const d of ends) {
+          if (o === d) continue;
+          for (const type of ['car', 'bike', 'bus', 'truck'] as const) {
+            // No signals, no other traffic: travel time must equal the free-flow reference.
+            const lone = {
+              ...sc,
+              nodes: sc.nodes.map((n) => ({ ...n, signal: undefined })),
+              flows: [{ id: 'f', origin: o, destination: d, rate: 3600, maxVehicles: 1, mix: { car: 0, bus: 0, bike: 0, truck: 0, [type]: 1 }, speedFactor: 1, start: 0, end: 1e9 }],
+            };
+            const sim = new Simulation(lone);
+            for (let i = 0; i < 6000 && sim.trips.length === 0 && sim.unroutable === 0; i++) sim.step();
+            const t = sim.trips[0];
+            if (!t) continue; // destination not reachable from this origin
+            expect(Math.abs(t.travelTime - t.freeFlowTime), `${id} ${o}→${d} ${type}`).toBeLessThan(1e-9);
+          }
+        }
       }
     }
   });
