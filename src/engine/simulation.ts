@@ -1,0 +1,832 @@
+import { buildNetwork, segmentLevel, type Connector, type Lane, type Network, type Segment } from './network';
+import { Rng } from './rng';
+import { freeFlowCost, reachableExits, shortestRoute, type EdgeCost } from './routing';
+import { lightFor } from './signals';
+import { idmAccel, VEHICLE_PARAMS, type VehicleParams } from './vehicles';
+import { rightNormal, scale, norm, sub } from './geometry';
+import type { FlowDef, Scenario, VehicleType } from './types';
+
+export const DT = 0.1;
+const SAMPLE_EVERY = 1; // seconds between metric samples
+const LANE_CHANGE_EVERY = 5; // steps
+const MOBIL_THRESHOLD = 0.25;
+const SAFE_DECEL = 4;
+const QUEUE_SPEED = 2; // m/s below which a vehicle counts as queued
+
+export interface Vehicle {
+  id: number;
+  type: VehicleType;
+  p: VehicleParams;
+  /** Personal desired speed (m/s). */
+  v0: number;
+  seg: number;
+  /** Front-bumper position along the current segment. */
+  s: number;
+  v: number;
+  acc: number;
+  route: number[];
+  /** Index into route of the edge being driven (or being left, while on a connector). */
+  ri: number;
+  dest: string;
+  flowId: string;
+  spawnT: number;
+  entryWait: number;
+  dist: number;
+  freeFlowTime: number;
+  /** Connector this vehicle may enter at the next junction. */
+  grant: number | null;
+  /** Connector whose junction area this vehicle's body still occupies. */
+  occupying: number | null;
+  requestT: number;
+  stuckT: number;
+  stoppedTime: number;
+  lastLaneChange: number;
+  /** Lateral offset (m, toward kerb) still being animated after a lane change. */
+  lat: number;
+  edgeEnterT: number;
+}
+
+export interface TripRecord {
+  id: number;
+  type: VehicleType;
+  flowId: string;
+  travelTime: number;
+  freeFlowTime: number;
+  distance: number;
+  entryWait: number;
+  stoppedTime: number;
+  exitT: number;
+}
+
+export interface Sample {
+  t: number;
+  active: number;
+  meanSpeed: number;
+  throughput: number; // veh/h over the last 60 s
+  exited: number;
+  queued: number;
+  queueLength: number; // total metres of queues at junction approaches
+  backlog: number;
+  density: number; // network-wide veh/km/lane
+}
+
+export interface EdgeLive {
+  count: number;
+  meanSpeed: number;
+  density: number; // veh/km/lane
+  congestion: number; // 0 free-flow … 1 jammed
+  queueLength: number; // metres, longest lane queue at the downstream junction
+}
+
+export interface Summary {
+  simTime: number;
+  spawned: number;
+  completed: number;
+  active: number;
+  backlog: number;
+  avgTravelTime: number;
+  avgDelay: number;
+  avgTripSpeed: number;
+  avgSpeed: number;
+  throughputPerHour: number;
+  avgQueueLength: number;
+  maxQueueLength: number;
+  avgDensity: number;
+  stopsShare: number;
+  unroutable: number;
+  safetyInterventions: number;
+}
+
+interface FlowState {
+  def: FlowDef;
+  nextT: number;
+  generated: number;
+  backlog: { type: VehicleType; dest: string | null; requestT: number }[];
+  entryEdge: number | null;
+}
+
+export class Simulation {
+  readonly net: Network;
+  readonly scenario: Scenario;
+  t = 0;
+  steps = 0;
+  vehicles: Vehicle[] = [];
+  trips: TripRecord[] = [];
+  samples: Sample[] = [];
+  /** Vehicles per segment, sorted by s ascending. */
+  occ: Vehicle[][];
+  /** Vehicles that entered each junction (node id → count). */
+  nodeThroughput = new Map<string, number>();
+  /** Running max queue length per lane id. */
+  maxQueueByLane = new Map<number, number>();
+  spawned = 0;
+  laneChangeCount = 0;
+  unroutable = 0;
+  safetyInterventions = 0;
+
+  private rng: Rng;
+  private nextId = 1;
+  private flows: FlowState[];
+  private routeCache = new Map<string, number[] | null>();
+  private edgeTT: Float64Array;
+  private cost: EdgeCost;
+  private sideSign: number;
+  private exitTimes: number[] = [];
+  private queueByLane = new Map<number, number>();
+
+  constructor(scenario: Scenario) {
+    this.scenario = scenario;
+    this.net = buildNetwork(scenario);
+    this.rng = new Rng(scenario.seed);
+    this.occ = this.net.segments.map(() => []);
+    this.sideSign = scenario.driveSide === 'right' ? 1 : -1;
+    const ff = freeFlowCost(this.net);
+    this.edgeTT = new Float64Array(this.net.edges.length);
+    this.net.edges.forEach((e) => (this.edgeTT[e.id] = e.length / Math.max(1, e.speedLimit)));
+    this.cost = scenario.congestionAwareRouting
+      ? (id) => ff(id) - this.net.edges[id].length / Math.max(1, this.net.edges[id].speedLimit) + this.edgeTT[id]
+      : ff;
+    this.flows = scenario.flows.map((def) => {
+      const entry = this.net.entryEdges.find((e) => this.net.edges[e].from === def.origin) ?? null;
+      if (entry === null) this.net.warnings.push(`Flow ${def.name ?? def.id}: origin is not an entry point.`);
+      return {
+        def,
+        entryEdge: entry,
+        generated: 0,
+        backlog: [],
+        nextT: def.start + (def.rate > 0 ? this.rng.exponential(def.rate / 3600) : Infinity),
+      };
+    });
+  }
+
+  // ---------------------------------------------------------------- public API
+
+  step(): void {
+    this.t += DT;
+    this.steps++;
+    this.spawn();
+    this.junctionControl();
+    this.move();
+    this.rebuildOccupancy();
+    if (this.steps % LANE_CHANGE_EVERY === 0) this.laneChanges();
+    this.updateStuck();
+    this.animateLateral();
+    if (this.scenario.congestionAwareRouting && this.steps % 300 === 0) this.routeCache.clear();
+    if (this.steps % Math.round(SAMPLE_EVERY / DT) === 0) this.sample();
+  }
+
+  run(seconds: number, onProgress?: (fraction: number) => void): void {
+    const n = Math.round(seconds / DT);
+    for (let i = 0; i < n; i++) {
+      this.step();
+      if (onProgress && i % 500 === 0) onProgress(i / n);
+    }
+  }
+
+  segment(id: number): Segment {
+    return this.net.segments[id];
+  }
+
+  pose(v: Vehicle): { x: number; y: number; heading: number; level: number } {
+    const seg = this.net.segments[v.seg];
+    const p = seg.path.pose(v.s - v.p.length / 2);
+    let { x, y } = p;
+    if (v.lat !== 0 && seg.kind === 'lane') {
+      const d = norm(sub(seg.path.points[1], seg.path.points[0]));
+      const side = scale(rightNormal(d), this.sideSign);
+      x += side.x * v.lat;
+      y += side.y * v.lat;
+    }
+    return { x, y, heading: p.heading, level: segmentLevel(seg, v.s) };
+  }
+
+  /** Moves a vehicle to another lane position (used by tests and tooling to set up situations). */
+  relocate(v: Vehicle, laneId: number, s: number): void {
+    const lane = this.net.segments[laneId];
+    if (lane.kind !== 'lane') throw new Error('relocate expects a lane');
+    v.seg = laneId;
+    v.s = s;
+    v.ri = v.route.indexOf(lane.edge);
+    v.grant = null;
+    v.requestT = -1;
+    this.rebuildOccupancy();
+  }
+
+  backlogCount(): number {
+    return this.flows.reduce((a, f) => a + f.backlog.length, 0);
+  }
+
+  edgeLive(edgeId: number): EdgeLive {
+    const e = this.net.edges[edgeId];
+    let count = 0;
+    let speed = 0;
+    let queue = 0;
+    for (const lid of e.lanes) {
+      for (const v of this.occ[lid]) {
+        count++;
+        speed += v.v;
+      }
+      queue = Math.max(queue, this.queueByLane.get(lid) ?? 0);
+    }
+    const meanSpeed = count ? speed / count : e.speedLimit;
+    const density = count / Math.max(0.001, (e.length * e.lanes.length) / 1000);
+    return {
+      count,
+      meanSpeed,
+      density,
+      congestion: count ? Math.max(0, Math.min(1, 1 - meanSpeed / e.speedLimit)) : 0,
+      queueLength: queue,
+    };
+  }
+
+  laneQueue(laneId: number): number {
+    return this.queueByLane.get(laneId) ?? 0;
+  }
+
+  summary(): Summary {
+    const done = this.trips;
+    const n = done.length;
+    const sum = (f: (r: TripRecord) => number) => done.reduce((a, r) => a + f(r), 0);
+    const totalTime = sum((r) => r.travelTime);
+    const samples = this.samples;
+    const avg = (f: (s: Sample) => number) => (samples.length ? samples.reduce((a, s) => a + f(s), 0) / samples.length : 0);
+    const speedSamples = samples.filter((s) => s.active > 0);
+    return {
+      simTime: this.t,
+      spawned: this.spawned,
+      completed: n,
+      active: this.vehicles.length,
+      backlog: this.backlogCount(),
+      avgTravelTime: n ? totalTime / n : 0,
+      avgDelay: n ? sum((r) => Math.max(0, r.travelTime - r.freeFlowTime)) / n : 0,
+      avgTripSpeed: totalTime > 0 ? sum((r) => r.distance) / totalTime : 0,
+      avgSpeed: speedSamples.length ? speedSamples.reduce((a, s) => a + s.meanSpeed, 0) / speedSamples.length : 0,
+      throughputPerHour: this.t > 0 ? (n / this.t) * 3600 : 0,
+      avgQueueLength: avg((s) => s.queueLength),
+      maxQueueLength: Math.max(0, ...this.maxQueueByLane.values()),
+      avgDensity: avg((s) => s.density),
+      stopsShare: totalTime > 0 ? sum((r) => r.stoppedTime) / totalTime : 0,
+      unroutable: this.unroutable,
+      safetyInterventions: this.safetyInterventions,
+    };
+  }
+
+  /**
+   * Invariant check used by tests: bumper overlaps on any segment, and pairs of conflicting
+   * junction movements occupied at the same time.
+   */
+  invariantViolations(): string[] {
+    const out: string[] = [];
+    for (let id = 0; id < this.occ.length; id++) {
+      const list = this.occ[id];
+      for (let i = 0; i + 1 < list.length; i++) {
+        const f = list[i];
+        const l = list[i + 1];
+        if (f.s > l.s - l.p.length + 1e-6) out.push(`overlap on segment ${id}: ${f.id} into ${l.id}`);
+      }
+    }
+    const occupied = new Set<number>();
+    for (const v of this.vehicles) if (v.occupying !== null) occupied.add(v.occupying);
+    for (const c of occupied) {
+      for (const k of (this.net.segments[c] as Connector).conflicts) {
+        if (k > c && occupied.has(k)) out.push(`conflicting movements ${c} and ${k} occupied together`);
+      }
+    }
+    return out;
+  }
+
+  // ---------------------------------------------------------------- demand
+
+  private routeFor(entryEdge: number, dest: string): number[] | null {
+    const key = `${entryEdge}>${dest}`;
+    if (!this.routeCache.has(key)) this.routeCache.set(key, shortestRoute(this.net, entryEdge, dest, this.cost));
+    return this.routeCache.get(key)!;
+  }
+
+  private spawn(): void {
+    for (const f of this.flows) {
+      const d = f.def;
+      while (this.t >= f.nextT && f.nextT < d.end && (d.maxVehicles === undefined || f.generated < d.maxVehicles)) {
+        const type = this.rng.pickWeighted(['car', 'bus', 'bike', 'truck'] as const, (k) => d.mix[k]) ?? 'car';
+        let dest = d.destination;
+        if (!dest && f.entryEdge !== null) {
+          const exits = reachableExits(this.net, f.entryEdge).filter((x) => x !== d.origin);
+          dest = exits.length ? exits[this.rng.int(exits.length)] : null;
+        }
+        f.backlog.push({ type, dest, requestT: f.nextT });
+        f.generated++;
+        f.nextT += this.rng.exponential(Math.max(1e-6, d.rate) / 3600);
+      }
+      if (f.entryEdge === null) {
+        this.unroutable += f.backlog.length;
+        f.backlog.length = 0;
+        continue;
+      }
+      if (f.backlog.length > 0) this.tryInsert(f, f.entryEdge);
+    }
+  }
+
+  private tryInsert(f: FlowState, entry: number): void {
+    const spec = f.backlog[0];
+    const dest = spec.dest;
+    const route = dest ? this.routeFor(entry, dest) : null;
+    if (!route || !dest) {
+      f.backlog.shift();
+      this.unroutable++;
+      return;
+    }
+    const p = VEHICLE_PARAMS[spec.type];
+    const edge = this.net.edges[entry];
+    const v0 = Math.max(3, p.desiredSpeed * f.def.speedFactor * this.rng.normal(1, 0.08));
+    // Prefer lanes that already serve the next movement, then the one with the most room.
+    let best: { lane: Lane; gap: number; leaderV: number } | null = null;
+    for (const lid of edge.lanes) {
+      const lane = this.net.segments[lid] as Lane;
+      const list = this.occ[lid];
+      const leader = list[0];
+      const gap = leader ? leader.s - leader.p.length : Infinity;
+      const serves = route.length < 2 || lane.connectorsOut.some((c) => (this.net.segments[c] as Connector).toEdge === route[1]);
+      const score = (serves ? 1e6 : 0) + Math.min(gap, 1e5);
+      const bestServes = best && (route.length < 2 || best.lane.connectorsOut.some((c) => (this.net.segments[c] as Connector).toEdge === route[1]));
+      const bestScore = best ? (bestServes ? 1e6 : 0) + Math.min(best.gap, 1e5) : -Infinity;
+      if (score > bestScore) best = { lane, gap, leaderV: leader?.v ?? Infinity };
+    }
+    if (!best || best.gap < p.minGap + 1) return;
+    let v = Math.min(v0, best.lane.speedLimit);
+    if (Number.isFinite(best.gap)) {
+      v = Math.min(v, best.leaderV + 2, Math.max(0, (best.gap - p.minGap) / p.headway));
+    }
+    f.backlog.shift();
+    const veh: Vehicle = {
+      id: this.nextId++,
+      type: spec.type,
+      p,
+      v0,
+      seg: best.lane.id,
+      s: 0,
+      v,
+      acc: 0,
+      route,
+      ri: 0,
+      dest,
+      flowId: f.def.id,
+      spawnT: this.t,
+      entryWait: this.t - spec.requestT,
+      dist: 0,
+      freeFlowTime: route.reduce((a, e) => a + this.net.edges[e].length / Math.min(v0, this.net.edges[e].speedLimit), 0),
+      grant: null,
+      occupying: null,
+      requestT: -1,
+      stuckT: 0,
+      stoppedTime: 0,
+      lastLaneChange: -Infinity,
+      lat: 0,
+      edgeEnterT: this.t,
+    };
+    this.vehicles.push(veh);
+    this.occ[best.lane.id].unshift(veh);
+    this.spawned++;
+  }
+
+  // ---------------------------------------------------------------- junctions
+
+  /** The connector this vehicle needs from its current lane, or null if it is in the wrong lane / exiting. */
+  private wantedConnector(v: Vehicle, laneId = v.seg): number | null {
+    const lane = this.net.segments[laneId];
+    if (lane.kind !== 'lane' || v.ri >= v.route.length - 1) return null;
+    const next = v.route[v.ri + 1];
+    for (const c of lane.connectorsOut) if ((this.net.segments[c] as Connector).toEdge === next) return c;
+    return null;
+  }
+
+  private isExiting(v: Vehicle): boolean {
+    const seg = this.net.segments[v.seg];
+    return seg.kind === 'lane' && v.ri === v.route.length - 1 && this.net.nodes.get(seg.toNode)!.isEndpoint;
+  }
+
+  private canStop(v: Vehicle, distance: number, decel: number): boolean {
+    return distance > (v.v * v.v) / (2 * decel) + 0.5;
+  }
+
+  /** Free room at the start of a lane, in metres. Moving tails count as room since they clear ahead of us. */
+  private laneRoom(laneId: number): number {
+    const tail = this.occ[laneId][0];
+    if (!tail) return this.net.segments[laneId].length;
+    if (tail.v > 3) return Infinity;
+    return tail.s - tail.p.length;
+  }
+
+  /**
+   * Junction access control. Vehicles approaching a junction request their movement; requests are
+   * served first-come-first-served, subject to the signal, to conflicts with movements already
+   * granted or occupied, and to room on the exit lane ("don't block the box"). A blocked earlier
+   * request reserves its movement so later conflicting traffic cannot starve it.
+   */
+  private junctionControl(): void {
+    type Cand = { v: Vehicle; c: Connector; pred: Vehicle | null };
+    const byNode = new Map<string, Cand[]>();
+    for (const lane of this.net.lanes) {
+      const list = this.occ[lane.id];
+      if (list.length === 0) continue;
+      const node = this.net.nodes.get(lane.toNode)!;
+      if (node.isEndpoint) continue;
+      const light = lightFor(node, lane.roadId, this.t);
+      let pred: Vehicle | null = null;
+      for (let i = list.length - 1; i >= 0; i--) {
+        const v = list[i];
+        const distance = lane.length - v.s;
+        if (distance > Math.max(30, (v.v * v.v) / (2 * v.p.decel) + 15)) break;
+        const c = this.wantedConnector(v);
+        if (c === null) break;
+        if (v.grant === c) {
+          // A red light revokes a grant if the vehicle can still stop comfortably.
+          if (light === 'red' && this.canStop(v, distance, v.p.decel * 1.5)) v.grant = null;
+          else {
+            pred = v;
+            continue;
+          }
+        }
+        if (light === 'red') break;
+        if (light === 'yellow' && this.canStop(v, distance, v.p.decel)) break;
+        if (v.requestT < 0) v.requestT = this.t;
+        const list2 = byNode.get(node.id) ?? [];
+        list2.push({ v, c: this.net.segments[c] as Connector, pred: pred && pred.grant !== null ? null : pred });
+        byNode.set(node.id, list2);
+        pred = v;
+      }
+    }
+    if (byNode.size === 0) return;
+
+    const busyByNode = new Map<string, Set<number>>();
+    const pendingByLane = new Map<number, number>();
+    for (const v of this.vehicles) {
+      for (const c of [v.grant, v.occupying]) {
+        if (c === null) continue;
+        const conn = this.net.segments[c] as Connector;
+        const set = busyByNode.get(conn.node) ?? new Set<number>();
+        set.add(c);
+        busyByNode.set(conn.node, set);
+        if (c === v.grant || this.net.segments[v.seg].kind === 'connector') {
+          pendingByLane.set(conn.toLane, (pendingByLane.get(conn.toLane) ?? 0) + v.p.length + v.p.minGap);
+        }
+      }
+    }
+    for (const [nodeId, cands] of byNode) {
+      cands.sort((a, b) => a.v.requestT - b.v.requestT || a.v.id - b.v.id);
+      const busy = busyByNode.get(nodeId) ?? new Set<number>();
+      const reserved = new Set<number>();
+      for (const { v, c, pred } of cands) {
+        if (pred && pred.grant === null) continue;
+        if (c.conflicts.some((k) => busy.has(k) || reserved.has(k))) {
+          reserved.add(c.id);
+          continue;
+        }
+        const pending = pendingByLane.get(c.toLane) ?? 0;
+        if (this.laneRoom(c.toLane) - pending < v.p.length + v.p.minGap) continue;
+        v.grant = c.id;
+        busy.add(c.id);
+        pendingByLane.set(c.toLane, pending + v.p.length + v.p.minGap);
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------- longitudinal
+
+  /** Gap and speed of whatever is ahead along the vehicle's path, including virtual stop lines. */
+  private obstacleAhead(v: Vehicle): { gap: number; dv: number; slowTo?: { dist: number; speed: number } } {
+    const list = this.occ[v.seg];
+    const idx = list.indexOf(v);
+    const leader = list[idx + 1];
+    if (leader) return { gap: leader.s - leader.p.length - v.s, dv: v.v - leader.v };
+    const seg = this.net.segments[v.seg];
+    let ahead = seg.length - v.s;
+    if (seg.kind === 'lane') {
+      if (this.isExiting(v)) return { gap: Infinity, dv: 0 };
+      const want = this.wantedConnector(v);
+      if (want === null || v.grant !== want) {
+        // Stop line (or end of lane when in the wrong lane). Stop ~1 m short of the line.
+        return { gap: ahead + v.p.minGap - 1, dv: v.v };
+      }
+      const c = this.net.segments[want] as Connector;
+      const slowTo = { dist: ahead, speed: c.speedLimit };
+      // Vehicles that just left this lane on any movement still share the junction mouth with us.
+      let near: Vehicle | null = this.occ[c.id][0] ?? null;
+      for (const other of seg.connectorsOut) {
+        const o = this.occ[other][0];
+        if (other !== c.id && o && o.s - o.p.length < 3 && (!near || o.s - o.p.length < near.s - near.p.length)) near = o;
+      }
+      if (near) return { gap: ahead + near.s - near.p.length, dv: v.v - near.v, slowTo };
+      const tail = this.occ[c.toLane][0];
+      if (tail) return { gap: ahead + c.length + tail.s - tail.p.length, dv: v.v - tail.v, slowTo };
+      return { gap: Infinity, dv: 0, slowTo };
+    }
+    // On a connector: look into the exit lane, then at its far end.
+    const out = this.net.segments[seg.toLane] as Lane;
+    const tail = this.occ[out.id][0];
+    if (tail) return { gap: ahead + tail.s - tail.p.length, dv: v.v - tail.v };
+    ahead += out.length;
+    const exiting = v.ri + 1 === v.route.length - 1 && this.net.nodes.get(out.toNode)!.isEndpoint;
+    if (exiting) return { gap: Infinity, dv: 0 };
+    return { gap: ahead + v.p.minGap - 1, dv: v.v };
+  }
+
+  private accelFor(v: Vehicle): number {
+    const seg = this.net.segments[v.seg];
+    const v0 = Math.min(v.v0, seg.speedLimit);
+    const ob = this.obstacleAhead(v);
+    let a = idmAccel(v.p, v.v, v0, ob.gap, ob.dv);
+    if (ob.slowTo && v.v > ob.slowTo.speed) {
+      const need = (ob.slowTo.speed ** 2 - v.v ** 2) / (2 * Math.max(1, ob.slowTo.dist));
+      a = Math.min(a, need);
+    }
+    return Math.max(-v.p.maxDecel, Math.min(v.p.accel, a));
+  }
+
+  private move(): void {
+    for (const v of this.vehicles) v.acc = this.accelFor(v);
+    const exited: Vehicle[] = [];
+    for (const v of this.vehicles) {
+      let ds: number;
+      const nv = v.v + v.acc * DT;
+      if (nv < 0) {
+        ds = v.acc < 0 ? -(v.v * v.v) / (2 * v.acc) : 0;
+        v.v = 0;
+      } else {
+        ds = v.v * DT + 0.5 * v.acc * DT * DT;
+        v.v = nv;
+      }
+      v.s += ds;
+      v.dist += ds;
+      if (v.v < 0.5) v.stoppedTime += DT;
+      for (;;) {
+        const seg = this.net.segments[v.seg];
+        if (v.s < seg.length) break;
+        if (seg.kind === 'lane') {
+          if (this.isExiting(v)) {
+            exited.push(v);
+            break;
+          }
+          if (v.grant === null || !seg.connectorsOut.includes(v.grant)) {
+            // Would overrun a stop line without permission: hold it (counts as a safety intervention).
+            v.s = seg.length - 0.01;
+            v.v = 0;
+            this.safetyInterventions++;
+            break;
+          }
+          const c = this.net.segments[v.grant] as Connector;
+          const prevEdge = seg.edge;
+          this.edgeTT[prevEdge] = 0.85 * this.edgeTT[prevEdge] + 0.15 * (this.t - v.edgeEnterT);
+          v.s -= seg.length;
+          v.seg = c.id;
+          v.occupying = c.id;
+          v.grant = null;
+          v.requestT = -1;
+          v.lat = 0;
+          this.nodeThroughput.set(c.node, (this.nodeThroughput.get(c.node) ?? 0) + 1);
+        } else {
+          v.s -= seg.length;
+          v.seg = seg.toLane;
+          v.ri++;
+          v.edgeEnterT = this.t;
+        }
+      }
+      if (v.occupying !== null && this.net.segments[v.seg].kind === 'lane' && v.s - v.p.length >= 0) v.occupying = null;
+    }
+    if (exited.length) {
+      const gone = new Set(exited);
+      for (const v of exited) {
+        this.trips.push({
+          id: v.id,
+          type: v.type,
+          flowId: v.flowId,
+          travelTime: this.t - v.spawnT,
+          freeFlowTime: v.freeFlowTime,
+          distance: v.dist,
+          entryWait: v.entryWait,
+          stoppedTime: v.stoppedTime,
+          exitT: this.t,
+        });
+        this.exitTimes.push(this.t);
+      }
+      this.vehicles = this.vehicles.filter((v) => !gone.has(v));
+    }
+  }
+
+  private rebuildOccupancy(): void {
+    for (const list of this.occ) list.length = 0;
+    for (const v of this.vehicles) this.occ[v.seg].push(v);
+    for (const list of this.occ) {
+      if (list.length < 2) continue;
+      list.sort((a, b) => a.s - b.s || b.id - a.id);
+      // Hard non-overlap guarantee; IDM should make this a no-op.
+      for (let i = list.length - 2; i >= 0; i--) {
+        const f = list[i];
+        const l = list[i + 1];
+        const limit = l.s - l.p.length - 0.05;
+        if (f.s > limit) {
+          f.dist -= f.s - limit;
+          f.s = limit;
+          f.v = Math.min(f.v, l.v);
+          this.safetyInterventions++;
+        }
+      }
+    }
+  }
+
+  /** A vehicle stuck at the end of a lane that cannot serve its route (missed lane change) re-routes from there. */
+  private updateStuck(): void {
+    for (const v of this.vehicles) {
+      const seg = this.net.segments[v.seg];
+      if (seg.kind !== 'lane' || this.isExiting(v)) continue;
+      if (this.wantedConnector(v) !== null) {
+        v.stuckT = 0;
+        continue;
+      }
+      if (seg.length - v.s < 10 && v.v < 0.5) v.stuckT += DT;
+      if (v.stuckT > 6) this.reroute(v, seg);
+    }
+  }
+
+  private reroute(v: Vehicle, lane: Lane): void {
+    let best: number[] | null = null;
+    for (const cid of lane.connectorsOut) {
+      const c = this.net.segments[cid] as Connector;
+      const tail = shortestRoute(this.net, c.toEdge, v.dest, this.cost);
+      if (tail && (!best || tail.length < best.length)) best = tail;
+    }
+    if (!best && lane.connectorsOut.length) {
+      const c = this.net.segments[lane.connectorsOut[0]] as Connector;
+      const exits = reachableExits(this.net, c.toEdge);
+      if (exits.length) {
+        v.dest = exits[0];
+        best = shortestRoute(this.net, c.toEdge, v.dest, this.cost);
+      }
+    }
+    if (best) {
+      v.route = [...v.route.slice(0, v.ri + 1), ...best];
+      v.stuckT = 0;
+    }
+  }
+
+  // ---------------------------------------------------------------- lateral
+
+  private neighbours(laneId: number, s: number): { lead: Vehicle | null; follow: Vehicle | null } {
+    const list = this.occ[laneId];
+    let lead: Vehicle | null = null;
+    let follow: Vehicle | null = null;
+    for (const o of list) {
+      if (o.s >= s) {
+        lead = o;
+        break;
+      }
+      follow = o;
+    }
+    return { lead, follow };
+  }
+
+  private idmWith(v: Vehicle, s: number, leader: Vehicle | null, laneId: number): number {
+    const v0 = Math.min(v.v0, this.net.segments[laneId].speedLimit);
+    if (!leader) return idmAccel(v.p, v.v, v0, Infinity, 0);
+    return idmAccel(v.p, v.v, v0, leader.s - leader.p.length - s, v.v - leader.v);
+  }
+
+  /** MOBIL lane changing (Kesting, Treiber & Helbing 2007) plus mandatory changes for route-following. */
+  private laneChanges(): void {
+    let changed = false;
+    for (const v of this.vehicles) {
+      const seg = this.net.segments[v.seg];
+      if (seg.kind !== 'lane' || v.grant !== null || v.occupying !== null) continue;
+      if (this.t - v.lastLaneChange < 3 || v.s < v.p.length + 1 || seg.length - v.s < 2) continue;
+      const exiting = v.ri === v.route.length - 1;
+      const mandatory = !exiting && this.wantedConnector(v) === null;
+      const candidates: number[] = [];
+      if (mandatory) {
+        const edge = this.net.edges[seg.edge];
+        const good = edge.lanes.filter((l) => this.wantedConnector(v, l) !== null);
+        if (good.length === 0) continue;
+        const target = good.reduce((a, b) => (Math.abs(b - seg.id) < Math.abs(a - seg.id) ? b : a));
+        candidates.push(target < seg.id ? seg.inner! : seg.outer!);
+      } else {
+        for (const l of [seg.inner, seg.outer]) {
+          if (l !== null && (exiting || this.wantedConnector(v, l) !== null)) candidates.push(l);
+        }
+      }
+      const toEnd = seg.length - v.s;
+      const bSafe = mandatory ? (toEnd < 40 ? v.p.maxDecel * 0.75 : SAFE_DECEL) : SAFE_DECEL;
+      const minGap = mandatory && toEnd < 40 ? 0.5 : 1.0;
+      let bestLane: number | null = null;
+      let bestGain = mandatory ? -Infinity : MOBIL_THRESHOLD;
+      const curIdx = this.occ[seg.id].indexOf(v);
+      const realLead = this.occ[seg.id][curIdx + 1] ?? null;
+      const oldFollow = curIdx > 0 ? this.occ[seg.id][curIdx - 1] : null;
+      const aCur = this.idmWith(v, v.s, realLead, seg.id);
+      for (const target of candidates) {
+        const { lead, follow } = this.neighbours(target, v.s);
+        if (lead && lead.s - lead.p.length - v.s < minGap) continue;
+        if (follow && v.s - v.p.length - follow.s < minGap) continue;
+        const aNew = this.idmWith(v, v.s, lead, target);
+        // In stationary queues vehicles let each other in (zipper merge), so only moving traffic is judged on braking.
+        if (aNew < -bSafe && v.v > 1) continue;
+        const nfAfter = follow ? this.idmWith(follow, follow.s, v, target) : 0;
+        if (follow && nfAfter < -bSafe && !(mandatory && follow.v < 1)) continue;
+        if (follow && follow.grant !== null) continue;
+        const nfBefore = follow ? this.idmWith(follow, follow.s, lead, target) : 0;
+        const ofBefore = oldFollow ? this.idmWith(oldFollow, oldFollow.s, v, seg.id) : 0;
+        const ofAfter = oldFollow ? this.idmWith(oldFollow, oldFollow.s, realLead, seg.id) : 0;
+        const gain = aNew - aCur + v.p.politeness * (nfAfter - nfBefore + ofAfter - ofBefore);
+        if (gain > bestGain) {
+          bestGain = gain;
+          bestLane = target;
+        }
+      }
+      if (bestLane === null) continue;
+      const from = seg;
+      const to = this.net.segments[bestLane] as Lane;
+      v.lat += (from.index - to.index) * from.width;
+      v.seg = bestLane;
+      v.requestT = -1;
+      v.lastLaneChange = this.t;
+      v.stuckT = 0;
+      // keep occupancy sorted for the rest of this pass
+      const oldList = this.occ[from.id];
+      oldList.splice(oldList.indexOf(v), 1);
+      const newList = this.occ[bestLane];
+      let k = 0;
+      while (k < newList.length && newList[k].s < v.s) k++;
+      newList.splice(k, 0, v);
+      this.laneChangeCount++;
+      changed = true;
+    }
+    if (changed) this.rebuildOccupancy();
+  }
+
+  private animateLateral(): void {
+    const step = 1.2 * DT; // lateral speed 1.2 m/s
+    for (const v of this.vehicles) {
+      if (v.lat === 0) continue;
+      v.lat = Math.abs(v.lat) <= step ? 0 : v.lat - Math.sign(v.lat) * step;
+    }
+  }
+
+  // ---------------------------------------------------------------- metrics
+
+  private computeQueues(): number {
+    let total = 0;
+    this.queueByLane.clear();
+    for (const lane of this.net.lanes) {
+      if (this.net.nodes.get(lane.toNode)!.isEndpoint) continue;
+      const list = this.occ[lane.id];
+      let back = lane.length;
+      let q = 0;
+      for (let i = list.length - 1; i >= 0; i--) {
+        const v = list[i];
+        if (v.v > QUEUE_SPEED || v.s < back - v.p.minGap - 8) break;
+        back = v.s - v.p.length;
+        q = lane.length - back;
+      }
+      if (q > 0) {
+        this.queueByLane.set(lane.id, q);
+        this.maxQueueByLane.set(lane.id, Math.max(this.maxQueueByLane.get(lane.id) ?? 0, q));
+        total += q;
+      }
+    }
+    return total;
+  }
+
+  private sample(): void {
+    const queueLength = this.computeQueues();
+    let speed = 0;
+    let queued = 0;
+    for (const v of this.vehicles) {
+      speed += v.v;
+      if (v.v < QUEUE_SPEED) queued++;
+    }
+    while (this.exitTimes.length && this.exitTimes[0] < this.t - 60) this.exitTimes.shift();
+    let laneKm = 0;
+    for (const e of this.net.edges) laneKm += (e.length * e.lanes.length) / 1000;
+    this.samples.push({
+      t: Math.round(this.t * 10) / 10,
+      active: this.vehicles.length,
+      meanSpeed: this.vehicles.length ? speed / this.vehicles.length : 0,
+      throughput: (this.exitTimes.length * 3600) / Math.max(1, Math.min(60, this.t)),
+      exited: this.trips.length,
+      queued,
+      queueLength,
+      backlog: this.backlogCount(),
+      density: laneKm > 0 ? this.vehicles.length / laneKm : 0,
+    });
+  }
+}
+
+export interface RunResult {
+  summary: Summary;
+  samples: Sample[];
+  warnings: string[];
+}
+
+/** Headless run used by tests, scenario comparison (in a Web Worker) and the API. */
+export function runScenario(scenario: Scenario, duration = scenario.duration, onProgress?: (f: number) => void): RunResult {
+  const sim = new Simulation(scenario);
+  sim.run(duration, onProgress);
+  return { summary: sim.summary(), samples: sim.samples, warnings: sim.net.warnings };
+}
