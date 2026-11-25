@@ -13,6 +13,7 @@ import {
   type Vec,
   type Vehicle,
 } from '../engine';
+import { drawVehicleSprite, vehicleOutline, type Lod } from './vehicleSprites';
 
 /**
  * Canvas renderer. Reads simulation state; never changes it. Everything on screen is drawn from
@@ -52,7 +53,8 @@ const C = {
   green: '#2fbf71',
 };
 
-const CAR_COLORS = ['#e8e6df', '#9aa4b1', '#5b8def', '#d6453d', '#2f3540', '#c9b48a', '#6fb3a0', '#b7bcc4'];
+// Muted body colours that stay distinct from the asphalt (#2a2e35) and from each other.
+const CAR_COLORS = ['#e8e6df', '#9aa4b1', '#5b8def', '#d6453d', '#5d6675', '#c9b48a', '#6fb3a0', '#b7bcc4'];
 const TYPE_COLORS = { bus: '#f08c2e', truck: '#a68a5b', bike: '#4cc9f0' } as const;
 
 export function worldToScreen(cam: Camera, w: number, h: number, p: Vec): Vec {
@@ -331,38 +333,35 @@ function drawStopLines(ctx: CanvasRenderingContext2D, sim: Simulation, lanes: La
 }
 
 function drawVehicles(ctx: CanvasRenderingContext2D, sim: Simulation, include: (v: Vehicle) => boolean, px: number, elevated: boolean) {
+  const drawn = [];
   for (const v of sim.vehicles) {
     if (!include(v)) continue;
     const pose = sim.pose(v);
     const k = 1 + 0.06 * pose.level;
     const L = Math.max(v.p.length * k, MIN_VEHICLE_PX.length * px);
     const W = Math.max(v.p.width * k, MIN_VEHICLE_PX.width * px);
+    drawn.push({ v, pose, L, W });
+  }
+  // Shadows first, so none falls across a neighbouring vehicle. Vehicles on a deck cast further.
+  const off = elevated ? 0.9 : 0.22;
+  ctx.fillStyle = elevated ? 'rgba(0, 0, 0, 0.42)' : 'rgba(0, 0, 0, 0.32)';
+  for (const { v, pose, L, W } of drawn) {
+    ctx.save();
+    ctx.translate(pose.x + off, pose.y + off * 1.4);
+    ctx.rotate(pose.heading);
+    vehicleOutline(ctx, v.type, L, W);
+    ctx.fill();
+    ctx.restore();
+  }
+  for (const { v, pose, L, W } of drawn) {
+    // Level of detail from the on-screen length: full detail when large enough to read.
+    const onScreen = L / px;
+    const lod: Lod = onScreen >= 22 ? 2 : onScreen >= 11 ? 1 : 0;
+    const color = v.type === 'car' ? CAR_COLORS[v.id % CAR_COLORS.length] : TYPE_COLORS[v.type];
     ctx.save();
     ctx.translate(pose.x, pose.y);
     ctx.rotate(pose.heading);
-    if (elevated || pose.level > 0) {
-      ctx.fillStyle = 'rgba(0,0,0,0.35)';
-      ctx.fillRect(-L / 2 + 0.6, -W / 2 + 0.8, L, W);
-    }
-    const color = v.type === 'car' ? CAR_COLORS[v.id % CAR_COLORS.length] : TYPE_COLORS[v.type];
-    ctx.fillStyle = color;
-    roundRect(ctx, -L / 2, -W / 2, L, W, Math.min(W / 2.5, v.type === 'bike' ? 0.4 : 0.7));
-    ctx.fill();
-    if (px < 0.35) {
-      // windscreen
-      ctx.fillStyle = 'rgba(15,20,28,0.75)';
-      if (v.type === 'bike') ctx.fillRect(L / 2 - 0.7, -W / 4, 0.35, W / 2);
-      else ctx.fillRect(L / 2 - (v.type === 'car' ? 1.6 : 1.2), -W / 2 + 0.25, 0.55, W - 0.5);
-    }
-    // brake lights
-    if (v.acc < -1.2) {
-      ctx.fillStyle = '#ff3b30';
-      ctx.shadowColor = '#ff3b30';
-      ctx.shadowBlur = 6;
-      ctx.fillRect(-L / 2 - 0.05, -W / 2 + 0.1, 0.35, W * 0.28);
-      ctx.fillRect(-L / 2 - 0.05, W / 2 - 0.1 - W * 0.28, 0.35, W * 0.28);
-      ctx.shadowBlur = 0;
-    }
+    drawVehicleSprite(ctx, v.type, L, W, color, lod, v.acc < -1.2);
     ctx.restore();
   }
 }
