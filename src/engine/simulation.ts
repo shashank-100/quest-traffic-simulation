@@ -1,7 +1,7 @@
 import { buildNetwork, segmentLevel, type Connector, type Lane, type Network, type Segment } from './network';
 import { Rng } from './rng';
 import { freeFlowCost, reachableExits, shortestRoute, type EdgeCost } from './routing';
-import { lightFor } from './signals';
+import { lightFor, signalStatus, type LightState } from './signals';
 import { idmAccel, laneWidthEffect, VEHICLE_PARAMS, type LaneEffect, type VehicleParams } from './vehicles';
 import { rightNormal, scale, norm, sub } from './geometry';
 import type { FlowDef, Scenario, VehicleType } from './types';
@@ -12,6 +12,11 @@ const LANE_CHANGE_EVERY = 5; // steps
 const MOBIL_THRESHOLD = 0.25;
 const SAFE_DECEL = 4;
 const QUEUE_SPEED = 2; // m/s below which a vehicle counts as queued
+/**
+ * How far ahead along its route a vehicle looks for leaders and stop lines (m). Beyond about twice
+ * the IDM desired gap at urban speeds (s* ≈ 90 m at 60 km/h), an obstacle has no measurable effect.
+ */
+const LOOKAHEAD = 300;
 /** Height of a flyover deck above ground (m); sets ramp gradients. */
 export const DECK_HEIGHT = 6;
 const G = 9.81;
@@ -426,11 +431,7 @@ export class Simulation {
       spawnT: this.t,
       entryWait: this.t - spec.requestT,
       dist: 0,
-      // Free-flow time at this driver's desired speed, including lane-width effects on each edge.
-      freeFlowTime: route.reduce((a, e) => {
-        const edge = this.net.edges[e];
-        return a + edge.length / Math.min(v0 * this.laneEffect[edge.lanes[0]][spec.type].speed, edge.speedLimit);
-      }, 0),
+      freeFlowTime: this.freeFlowTime(route, v0, spec.type),
       grant: null,
       occupying: null,
       requestT: -1,
@@ -445,13 +446,36 @@ export class Simulation {
     this.spawned++;
   }
 
+  /**
+   * Time to drive a route alone at the driver's desired speed: every edge, plus the junction
+   * movement between consecutive edges, each at its own speed limit and lane-width effect.
+   */
+  private freeFlowTime(route: number[], v0: number, type: VehicleType): number {
+    let t = 0;
+    for (let i = 0; i < route.length; i++) {
+      const edge = this.net.edges[route[i]];
+      const lane = edge.lanes[0];
+      t += edge.length / Math.min(v0 * this.laneEffect[lane][type].speed, edge.speedLimit);
+      if (i + 1 === route.length) continue;
+      let best = Infinity;
+      for (const lid of edge.lanes) {
+        for (const cid of (this.net.segments[lid] as Lane).connectorsOut) {
+          const c = this.net.segments[cid] as Connector;
+          if (c.toEdge === route[i + 1]) best = Math.min(best, c.length / Math.min(v0 * this.laneEffect[cid][type].speed, c.speedLimit));
+        }
+      }
+      t += best;
+    }
+    return t;
+  }
+
   // ---------------------------------------------------------------- junctions
 
   /** The connector this vehicle needs from its current lane, or null if it is in the wrong lane / exiting. */
-  private wantedConnector(v: Vehicle, laneId = v.seg): number | null {
+  private wantedConnector(v: Vehicle, laneId = v.seg, ri = v.ri): number | null {
     const lane = this.net.segments[laneId];
-    if (lane.kind !== 'lane' || v.ri >= v.route.length - 1) return null;
-    const next = v.route[v.ri + 1];
+    if (lane.kind !== 'lane' || ri >= v.route.length - 1) return null;
+    const next = v.route[ri + 1];
     for (const c of lane.connectorsOut) if ((this.net.segments[c] as Connector).toEdge === next) return c;
     return null;
   }
@@ -461,8 +485,29 @@ export class Simulation {
     return seg.kind === 'lane' && v.ri === v.route.length - 1 && this.net.nodes.get(seg.toNode)!.isEndpoint;
   }
 
-  private canStop(v: Vehicle, distance: number, decel: number): boolean {
-    return distance > (v.v * v.v) / (2 * decel) + 0.5;
+  /**
+   * Distance before an intersection's stop line at which a vehicle requests its movement, and from
+   * which it treats the stop line as an obstacle until granted: its comfortable stopping distance,
+   * plus one desired time headway of reaction, plus the 20 m it needs to come to rest smoothly with
+   * IDM (so that, at green, it is granted before the stop line ever influences it).
+   */
+  private requestZone(v: Vehicle): number {
+    return Math.max(30, (v.v * v.v) / (2 * v.p.decel) + v.v * v.p.headway + 20);
+  }
+
+  /**
+   * Whether the light lets a vehicle `distance` from the stop line enter on movement c (or keep its
+   * grant). Green: yes. Red: never, so a grant issued earlier is withdrawn. Yellow: only if it is
+   * sure to reach the stop line before the yellow ends. Its speed until the line never drops below
+   * min(current speed, the movement's curve speed): it only brakes for the curve. So
+   * distance / that speed bounds its arrival time, and the bound only improves as it follows that
+   * plan. A grant kept on yellow therefore stays valid until the vehicle crosses, and anyone
+   * refused is still far enough back to stop.
+   */
+  private lightAllows(light: LightState, v: Vehicle, distance: number, yellowLeft: number, c: Connector): boolean {
+    if (light === 'green') return true;
+    if (light === 'red') return false;
+    return distance <= Math.min(v.v, c.speedLimit) * yellowLeft;
   }
 
   /** Free room at the start of a lane, in metres. Moving tails count as room since they clear ahead of us. */
@@ -486,8 +531,9 @@ export class Simulation {
       const list = this.occ[lane.id];
       if (list.length === 0) continue;
       const node = this.net.nodes.get(lane.toNode)!;
-      if (node.isEndpoint) continue;
+      if (node.control !== 'intersection') continue;
       const light = lightFor(node, lane.roadId, this.t);
+      const yellowLeft = light === 'yellow' ? signalStatus(node.signal!, this.t).remaining : 0;
       let pred: Vehicle | null = null;
       // Walk the lane front to back. A vehicle may only hold a grant while every vehicle ahead of
       // it on the lane holds one too: grants behind a vehicle that has to wait are withdrawn, or a
@@ -497,21 +543,18 @@ export class Simulation {
         const v = list[i];
         const distance = lane.length - v.s;
         const c = this.wantedConnector(v);
-        if (distance > Math.max(30, (v.v * v.v) / (2 * v.p.decel) + 15) || c === null) {
+        if (distance > this.requestZone(v) || c === null) {
           stop = i;
           break;
         }
         if (v.grant !== null && v.grant !== c) v.grant = null;
-        if (v.grant === c && (pred === null || pred.grant !== null)) {
-          // A red light revokes a grant if the vehicle can still stop comfortably.
-          if (light === 'red' && this.canStop(v, distance, v.p.decel * 1.5)) v.grant = null;
-          else {
-            pred = v;
-            continue;
-          }
+        const allowed = this.lightAllows(light, v, distance, yellowLeft, this.net.segments[c] as Connector);
+        if (v.grant === c && (pred === null || pred.grant !== null) && allowed) {
+          pred = v;
+          continue;
         }
         v.grant = null;
-        if (light === 'red' || (light === 'yellow' && this.canStop(v, distance, v.p.decel))) {
+        if (!allowed) {
           stop = i - 1;
           break;
         }
@@ -629,57 +672,99 @@ export class Simulation {
 
   // ---------------------------------------------------------------- longitudinal
 
-  /** Gap and speed of whatever is ahead along the vehicle's path, including virtual stop lines. */
-  private obstacleAhead(v: Vehicle): { gap: number; dv: number; slowTo?: { dist: number; speed: number } } {
+  /**
+   * The nearest obstacle along the vehicle's own route: another vehicle (on this segment, in a
+   * junction mouth shared with a diverging movement, merging from another approach, or further down
+   * the route), or a virtual stopped obstacle at an intersection stop line it has not been granted
+   * (seen only within its request zone) or at the end of a lane that does not serve its route.
+   * Simple connections are driven through. Also returns the deceleration needed to take the
+   * slowest upcoming junction curve at its safe speed.
+   */
+  private obstacleAhead(v: Vehicle): { gap: number; dv: number; curveDecel: number } {
     const list = this.occ[v.seg];
-    const idx = list.indexOf(v);
-    const leader = list[idx + 1];
-    if (leader) return { gap: leader.s - leader.p.length - v.s, dv: v.v - leader.v };
-    const seg = this.net.segments[v.seg];
-    let ahead = seg.length - v.s;
-    if (seg.kind === 'lane') {
-      if (this.isExiting(v)) return { gap: Infinity, dv: 0 };
-      const want = this.wantedConnector(v);
-      if (want === null || v.grant !== want) {
-        // Stop line (or end of lane when in the wrong lane). Stop ~1 m short of the line.
-        return { gap: ahead + v.p.minGap - 1, dv: v.v };
+    const leader = list[list.indexOf(v) + 1];
+    let gap = Infinity;
+    let leaderSpeed = 0;
+    let curveDecel = Infinity;
+    const see = (g: number, speed: number) => {
+      if (g < gap) {
+        gap = g;
+        leaderSpeed = speed;
       }
-      const c = this.net.segments[want] as Connector;
-      const slowTo = { dist: ahead, speed: c.speedLimit };
-      // Vehicles that just left this lane on any movement still share the junction mouth with us.
-      let near: Vehicle | null = this.occ[c.id][0] ?? null;
-      for (const other of seg.connectorsOut) {
-        const o = this.occ[other][0];
-        if (other !== c.id && o && o.s - o.p.length < 3 && (!near || o.s - o.p.length < near.s - near.p.length)) near = o;
-      }
-      // The closest of: traffic in the junction mouth, the exit lane's tail, and merging traffic.
-      let best: { gap: number; dv: number; slowTo?: { dist: number; speed: number } } = { gap: Infinity, dv: 0, slowTo };
-      if (near) best = { gap: ahead + near.s - near.p.length, dv: v.v - near.v, slowTo };
-      const tail = this.occ[c.toLane][0];
-      if (!near && tail) best = { gap: ahead + c.length + tail.s - tail.p.length, dv: v.v - tail.v, slowTo };
-      const m = this.mergeLeader(c, ahead + c.length);
-      if (m && m.gap < best.gap) best = { gap: m.gap, dv: v.v - m.v, slowTo };
-      return best;
+    };
+    const curve = (dist: number, c: Connector) => {
+      if (v.v > c.speedLimit) curveDecel = Math.min(curveDecel, (c.speedLimit ** 2 - v.v ** 2) / (2 * Math.max(1, dist)));
+    };
+    const done = () => ({ gap, dv: Number.isFinite(gap) ? v.v - leaderSpeed : 0, curveDecel });
+
+    let seg = this.net.segments[v.seg];
+    let ri = v.ri;
+    let dist = seg.length - v.s; // from our front bumper to the end of `seg`
+    if (leader) {
+      // The leader reaches any curve or stop line first; following it is sufficient.
+      see(leader.s - leader.p.length - v.s, leader.v);
+      return done();
     }
-    // On a connector: vehicles merging ahead of us, then the exit lane, then its far end.
-    const out = this.net.segments[seg.toLane] as Lane;
-    const tail = this.occ[out.id][0];
-    const m = this.mergeLeader(seg, ahead);
-    if (m && (!tail || m.gap < ahead + tail.s - tail.p.length)) return { gap: m.gap, dv: v.v - m.v };
-    if (tail) return { gap: ahead + tail.s - tail.p.length, dv: v.v - tail.v };
-    ahead += out.length;
-    const exiting = v.ri + 1 === v.route.length - 1 && this.net.nodes.get(out.toNode)!.isEndpoint;
-    if (exiting) return { gap: Infinity, dv: 0 };
-    return { gap: ahead + v.p.minGap - 1, dv: v.v };
+    if (seg.kind === 'connector') {
+      const m = this.mergeLeader(seg, dist);
+      if (m) see(m.gap, m.v);
+      seg = this.net.segments[seg.toLane];
+      ri++;
+      const tail = this.occ[seg.id][0];
+      if (tail) {
+        see(dist + tail.s - tail.p.length, tail.v);
+        return done();
+      }
+      dist += seg.length;
+    }
+    while (dist < LOOKAHEAD) {
+      const lane = seg as Lane;
+      const node = this.net.nodes.get(lane.toNode)!;
+      if (node.isEndpoint) break; // the route leaves the network here
+      const current = lane.id === v.seg;
+      const cid = this.wantedConnector(v, lane.id, ri);
+      if (cid === null) {
+        // Our own lane does not continue our route: stop at its end unless we change lanes first.
+        // A future lane that does not serve the route is resolved by a lane change before we get there.
+        if (current) see(dist + v.p.minGap - 1, 0);
+        break;
+      }
+      const c = this.net.segments[cid] as Connector;
+      if (node.control === 'intersection') {
+        if (!(current && v.grant === cid)) {
+          if (dist <= this.requestZone(v)) see(dist + v.p.minGap - 1, 0);
+          break;
+        }
+        const m = this.mergeLeader(c, dist + c.length);
+        if (m) see(m.gap, m.v);
+      }
+      curve(dist, c);
+      // A vehicle that left this lane on a diverging movement obstructs us until the paths separate.
+      for (const sib of c.siblings) {
+        const o = this.occ[sib.id][0];
+        if (o && o.s - o.p.length < sib.diverge) see(dist + o.s - o.p.length, o.v);
+      }
+      const onC = this.occ[cid][0];
+      if (onC) {
+        see(dist + onC.s - onC.p.length, onC.v);
+        break;
+      }
+      dist += c.length;
+      seg = this.net.segments[c.toLane];
+      ri++;
+      const tail = this.occ[seg.id][0];
+      if (tail) {
+        see(dist + tail.s - tail.p.length, tail.v);
+        break;
+      }
+      dist += seg.length;
+    }
+    return done();
   }
 
   private accelFor(v: Vehicle): number {
     const ob = this.obstacleAhead(v);
-    let a = idmAccel(v.p, v.v, this.desiredSpeed(v, v.seg), ob.gap, ob.dv, this.headwayOn(v, v.seg));
-    if (ob.slowTo && v.v > ob.slowTo.speed) {
-      const need = (ob.slowTo.speed ** 2 - v.v ** 2) / (2 * Math.max(1, ob.slowTo.dist));
-      a = Math.min(a, need);
-    }
+    const a = Math.min(idmAccel(v.p, v.v, this.desiredSpeed(v, v.seg), ob.gap, ob.dv, this.headwayOn(v, v.seg)), ob.curveDecel);
     // Climbing a ramp costs g·sinθ of the available acceleration (heavy vehicles feel it most).
     const maxAccel = Math.max(0.05, v.p.accel - G * this.grade[v.seg]);
     return Math.max(-v.p.maxDecel, Math.min(maxAccel, a));
@@ -718,14 +803,17 @@ export class Simulation {
             exited.push(v);
             break;
           }
-          if (v.grant === null || !seg.connectorsOut.includes(v.grant)) {
+          // Intersections need a grant; simple connections are driven through along the route.
+          const node = this.net.nodes.get(seg.toNode)!;
+          const cid = node.control === 'intersection' ? v.grant : this.wantedConnector(v);
+          if (cid === null || !seg.connectorsOut.includes(cid)) {
             // Would overrun a stop line without permission: hold it (counts as a safety intervention).
             v.s = seg.length - 0.01;
             v.v = 0;
             this.safetyInterventions++;
             break;
           }
-          const c = this.net.segments[v.grant] as Connector;
+          const c = this.net.segments[cid] as Connector;
           const prevEdge = seg.edge;
           this.edgeTT[prevEdge] = 0.85 * this.edgeTT[prevEdge] + 0.15 * (this.t - v.edgeEnterT);
           v.s -= seg.length;

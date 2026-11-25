@@ -52,7 +52,22 @@ export interface Connector {
   conflicts: number[];
   /** Movements converging into the same exit lane: may be shared if vehicles are staggered. */
   merges: number[];
+  /**
+   * Other movements leaving the same lane, with the arc length after which the two paths are far
+   * enough apart (CONFLICT_DISTANCE) that a vehicle on one no longer obstructs the other.
+   */
+  siblings: { id: number; diverge: number }[];
 }
+
+/**
+ * How a node controls traffic:
+ *  - 'endpoint': network entry/exit
+ *  - 'connection': no signal and no crossing or merging movements (e.g. a bend, a deck joint, a
+ *    lane gain). Vehicles drive straight through, governed only by car following.
+ *  - 'intersection': signalised, or has movements that cross or merge. Vehicles must request and
+ *    be granted their movement before entering.
+ */
+export type NodeControl = 'endpoint' | 'connection' | 'intersection';
 
 export type Segment = Lane | Connector;
 
@@ -77,6 +92,7 @@ export interface CompiledNode {
   level: Level;
   degree: number;
   isEndpoint: boolean;
+  control: NodeControl;
   setback: number;
   roads: { roadId: string; angle: number }[];
   inEdges: number[];
@@ -176,6 +192,7 @@ export function buildNetwork(scenario: Scenario): Network {
       level: def.level,
       degree,
       isEndpoint: degree === 1,
+      control: degree <= 1 ? 'endpoint' : 'connection',
       setback,
       roads: at.map((x) => ({ roadId: x.road.id, angle: x.angle })),
       inEdges: [],
@@ -322,6 +339,7 @@ export function buildNetwork(scenario: Scenario): Network {
             level: node.level,
             conflicts: [],
             merges: [],
+            siblings: [],
           };
           segments.push(c);
           connectors.push(c);
@@ -339,7 +357,12 @@ export function buildNetwork(scenario: Scenario): Network {
       for (let b = a + 1; b < node.connectors.length; b++) {
         const ca = segments[node.connectors[a]] as Connector;
         const cb = segments[node.connectors[b]] as Connector;
-        if (ca.fromLane === cb.fromLane) continue;
+        if (ca.fromLane === cb.fromLane) {
+          const d = divergeDistance(ca.path, cb.path);
+          ca.siblings.push({ id: cb.id, diverge: d });
+          cb.siblings.push({ id: ca.id, diverge: d });
+          continue;
+        }
         if (ca.toLane === cb.toLane && headOf(ca.path).minDistanceTo(headOf(cb.path)) > MERGE_CLEARANCE) {
           ca.merges.push(cb.id);
           cb.merges.push(ca.id);
@@ -351,7 +374,13 @@ export function buildNetwork(scenario: Scenario): Network {
     }
     // Signal plan
     const sig = node.def.signal;
-    if (sig?.enabled && sig.phases.length > 0 && node.degree >= 2) {
+    const signalised = !!(sig?.enabled && sig.phases.length > 0 && node.degree >= 2);
+    const interacting = node.connectors.some((id) => {
+      const c = segments[id] as Connector;
+      return c.conflicts.length > 0 || c.merges.length > 0;
+    });
+    if (node.degree >= 2) node.control = signalised || interacting ? 'intersection' : 'connection';
+    if (sig && signalised) {
       node.signal = sig;
       sig.phases.forEach((ph, i) => {
         for (const rid of ph.approaches) {
@@ -385,6 +414,22 @@ export function buildNetwork(scenario: Scenario): Network {
     exitEdges,
     warnings,
   };
+}
+
+/**
+ * Arc length along two paths leaving the same point after which they stay at least
+ * CONFLICT_DISTANCE apart (compared at equal arc length).
+ */
+function divergeDistance(a: Path, b: Path): number {
+  const L = Math.min(a.length, b.length);
+  const step = 0.25;
+  let last = 0;
+  for (let s = 0; s <= L; s += step) {
+    const pa = a.pose(s);
+    const pb = b.pose(s);
+    if (Math.hypot(pa.x - pb.x, pa.y - pb.y) < CONFLICT_DISTANCE) last = s + step;
+  }
+  return Math.min(last, L);
 }
 
 /** The first 70 % of a path: where two converging movements must not cross each other. */

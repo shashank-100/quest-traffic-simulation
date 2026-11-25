@@ -55,3 +55,48 @@ describe('junction rules', () => {
     expect(sim.trips.length).toBeGreaterThan(150);
   });
 });
+
+describe('simple connections versus intersections', () => {
+  const controlsOf = (id: string) => [...new Simulation(preset(id)).net.nodes.values()].filter((n) => !n.isEndpoint).map((n) => n.control);
+
+  it('classifies nodes: flyover joints are connections; crossings, merges and signals are intersections', () => {
+    expect(controlsOf('crossing-flyover')).toEqual(['connection', 'connection']);
+    expect(controlsOf('crossing-at-grade')).toEqual(['intersection']);
+    expect(controlsOf('lane-drop')).toEqual(['intersection']); // merging movements
+    expect(controlsOf('t-junction')).toEqual(['intersection']); // crossing movements, no signal
+  });
+
+  it('vehicles never request or hold permission at simple connections', () => {
+    const sim = new Simulation(preset('crossing-flyover'));
+    for (let i = 0; i < 4000; i++) {
+      sim.step();
+      for (const v of sim.vehicles) {
+        const seg = sim.net.segments[v.seg];
+        if (seg.kind === 'lane' && sim.net.nodes.get(seg.toNode)!.control === 'connection') {
+          expect(v.grant).toBeNull();
+          expect(v.requestT).toBe(-1);
+        }
+      }
+    }
+    expect(sim.summary().safetyInterventions).toBe(0);
+  });
+
+  it('a lone vehicle drives through connections and an empty intersection without braking or delay', () => {
+    for (const id of ['crossing-flyover', 'crossing-at-grade']) {
+      const sc = preset(id);
+      for (const f of sc.flows) {
+        // No signal, no other traffic: any braking or delay would come from the control logic itself.
+        const lone = { ...sc, nodes: sc.nodes.map((n) => ({ ...n, signal: undefined })), flows: [{ ...f, rate: 3600, maxVehicles: 1, mix: { car: 1, bus: 0, bike: 0, truck: 0 } }] };
+        const sim = new Simulation(lone);
+        let braked = false;
+        for (let i = 0; i < 3000 && sim.trips.length === 0; i++) {
+          sim.step();
+          for (const v of sim.vehicles) if (v.acc < -1e-6) braked = true;
+        }
+        const t = sim.trips[0];
+        expect(braked, `${id} ${f.name}`).toBe(false);
+        expect(Math.abs(t.travelTime - t.freeFlowTime), `${id} ${f.name}`).toBeLessThan(0.1); // one time step
+      }
+    }
+  });
+});

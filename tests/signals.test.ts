@@ -45,31 +45,32 @@ describe('signal timing', () => {
 });
 
 describe('signal compliance in simulation', () => {
-  it('no vehicle is admitted into the junction on red', () => {
-    const sc = preset('four-way');
-    const sim = new Simulation(sc);
-    const j = [...sim.net.nodes.values()].find((n) => n.signal)!;
-    const sigDef = j.signal!;
-    const insideBefore = new Set<number>();
-    let entries = 0;
-    for (let i = 0; i < 6000; i++) {
-      sim.step();
-      for (const v of sim.vehicles) {
-        const seg = sim.net.segments[v.seg];
-        if (seg.kind !== 'connector' || seg.node !== j.id || insideBefore.has(v.id)) continue;
-        insideBefore.add(v.id);
-        entries++;
-        const lane = sim.net.segments[seg.fromLane];
-        const light = lightFor(j, lane.kind === 'lane' ? lane.roadId : '', sim.t);
-        if (light === 'red') {
-          // Only vehicles already committed when the yellow ended may clear during all-red.
-          const st = signalStatus(sigDef, sim.t);
-          expect(st.stage).toBe('allRed');
-          expect(sigDef.allRed - st.remaining).toBeLessThan(1.5);
+  it('no vehicle enters on red, and a grant does not survive the light turning red', () => {
+    for (const id of ['four-way', 'crossing-at-grade', 'grid']) {
+      const sim = new Simulation(preset(id));
+      let entries = 0;
+      const seen = new Set<number>();
+      for (let i = 0; i < 6000; i++) {
+        sim.step();
+        for (const v of sim.vehicles) {
+          const seg = sim.net.segments[v.seg];
+          if (seg.kind === 'lane') {
+            const node = sim.net.nodes.get(seg.toNode)!;
+            // Nobody still approaching holds a grant while their light is red.
+            if (node.signal && lightFor(node, seg.roadId, sim.t) === 'red') expect(v.grant, `${id} vehicle ${v.id}`).toBeNull();
+            continue;
+          }
+          if (seen.has(v.id) || !sim.net.nodes.get(seg.node)!.signal) continue;
+          seen.add(v.id);
+          entries++;
+          const lane = sim.net.segments[seg.fromLane];
+          // Entering happens in the step it crosses the line, so check the light at the previous step.
+          expect(lightFor(sim.net.nodes.get(seg.node)!, lane.kind === 'lane' ? lane.roadId : '', sim.t - 0.1), `${id} vehicle ${v.id}`).not.toBe('red');
         }
       }
+      expect(entries, id).toBeGreaterThan(200);
+      expect(sim.safetyInterventions, id).toBe(0);
     }
-    expect(entries).toBeGreaterThan(200);
   });
 
   it('queues discharge from standstill at no more than the vehicle acceleration', () => {
