@@ -6,6 +6,8 @@ Built for Project 2 of the QUEST Lab (IISc Bangalore) Full Stack AI pre-doctoral
 
 **Live:** https://quest-traffic-simulation.shashank-telkhade.workers.dev
 
+![Demo: running a junction, the flyover scenario, and drawing a network](docs/demo.gif)
+
 ![Traffic Lab running the 3×3 city grid preset](docs/screenshot.jpg)
 
 ## Run it
