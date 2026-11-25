@@ -106,7 +106,7 @@ Demand is below capacity in both designs, so the flyover doesn't add throughput;
 | `POST` | `/api/simulate` | `{ scenario, duration ≤ 600, seed? }` → summary + time series |
 
 Limits on the public API:
-- **Request rate:** 20 simulations and 30 saves per minute per client.
+- **Request rate:** about 20 simulations and 30 saves per minute per client. Cloudflare's rate limiter counts approximately and per data centre, so short bursts can get through; the per-request budget below is what bounds the work.
 - **Network size:** 400 nodes, 600 roads and 100 flows for server-side runs.
 - **Work budget:** about 3 million lane-steps and 3 million vehicle-steps per run. Every preset uses under 15%.
 
