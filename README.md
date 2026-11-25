@@ -2,58 +2,279 @@
 
 Traffic Lab is a 2D top-down traffic simulator. You draw a road network, add traffic and signals, run an agent-based simulation, watch every vehicle move, and compare designs. A typical comparison is the same junction before and after adding a flyover.
 
-Built for Project 2 of the QUEST Lab (IISc) Full Stack AI pre-doctoral application.
+Built for Project 2 of the QUEST Lab (IISc Bangalore) Full Stack AI pre-doctoral application.
 
-## What it does
+**Live app:** https://quest-traffic-simulation.shashank-telkhade.workers.dev
 
-| Area | Features |
+![Traffic Lab running the 3×3 city grid preset](docs/screenshot.jpg)
+
+---
+
+## Contents
+
+1. [Quick start](#1-quick-start)
+2. [Using the app](#2-using-the-app)
+3. [Running the tests](#3-running-the-tests)
+4. [Deploying to Cloudflare](#4-deploying-to-cloudflare)
+5. [Backend API](#5-backend-api)
+6. [Architecture](#6-architecture)
+7. [Simulation model](#7-simulation-model)
+8. [Metrics](#8-metrics)
+9. [Validation and results](#9-validation-and-results)
+10. [Troubleshooting](#10-troubleshooting)
+11. [Limitations and next steps](#11-limitations-and-next-steps)
+
+---
+
+## 1. Quick start
+
+### Prerequisites
+
+| Tool | Version | Check with |
+| --- | --- | --- |
+| Node.js | 22.18 or newer | `node -v` |
+| npm | 10 or newer (comes with Node) | `npm -v` |
+| Git | any recent version | `git --version` |
+
+A Cloudflare account is only needed to deploy (step 4). Local development needs no account.
+
+### Steps
+
+```bash
+# 1. Clone the repository
+git clone https://github.com/shashank-100/quest-traffic-simulation.git
+cd quest-traffic-simulation
+
+# 2. Install dependencies
+npm install
+
+# 3. Start the app (frontend + backend API together)
+npm run dev
+```
+
+Open **http://localhost:5173**. The dev server runs the React frontend and the Worker API on the same port, with a local, persistent stand-in for the KV store. Saving and sharing scenarios therefore works offline too.
+
+To stop the server, press `Ctrl+C`.
+
+### Other commands
+
+| Command | What it does |
 | --- | --- |
-| **Road editor** | Draw roads (1–5 lanes each way, one-way or two-way, lane width, speed limit). Crossing a ground road creates a 4-way junction automatically; ending a road on another creates a T-junction. Flyovers are drawn in one gesture: up-ramp, elevated deck, down-ramp. Other tools: drag nodes, delete, undo. |
-| **Signals** | Add a signal to any junction. Default phases pair opposing approaches. Each phase has its own green time, and the signal has yellow, all-red and an offset (so neighbouring signals can form a green wave). The signal state shows live on the stop lines. |
-| **Traffic** | Flows from any entry point to a specific exit or to "any exit". Arrivals are Poisson with a set rate (veh/h). Each flow has a car / two-wheeler / bus / truck mix, a desired-speed factor, a start time and a vehicle cap. |
-| **Engine** | Each vehicle is an independent agent with position, velocity, acceleration and route. Car-following uses IDM; lane changes use MOBIL. Junction access is checked for conflicts. Vehicles obey signals, and routes are found by Dijkstra (optionally congestion-aware). |
-| **Visualisation** | Canvas rendering with pan and zoom. Play, pause, resume, step, reset, and speeds from 0.5× to 32×. Congestion heat overlay, brake lights, and decks with a cast shadow. Clicking a road or junction shows its live speed, density and queues. |
-| **Analytics** | Average speed, travel time, delay, throughput, queue lengths, density and time stopped, with time-series charts and a list of the most congested links. |
-| **Comparison** | Runs two scenarios headless in a Web Worker over N seeds (common random numbers). Reports mean ± SD per metric, Δ%, and overlaid time series. |
-| **Backend** | Cloudflare Worker with KV storage for saving and sharing scenarios (`?s=<id>` links), plus a headless `/api/simulate` endpoint that uses the same engine. |
+| `npm run dev` | Development server with hot reload (frontend + API) |
+| `npm test` | Runs all 55 engine and API tests once |
+| `npm run test:watch` | Re-runs tests on every file change |
+| `npm run build` | Type-checks everything, then builds for production |
+| `npm run preview` | Serves the production build locally |
+| `npm run deploy` | Runs the tests, then deploys to Cloudflare |
 
-## Architecture
+---
+
+## 2. Using the app
+
+### Watch a preset
+
+1. Open the **Scenario** menu (top right) and pick a preset, for example *Signalised 4-way junction*.
+2. Press **Play** (or `Space`). Use the speed buttons (0.5× to 32×) to speed up time.
+3. Scroll to zoom and drag to pan. The **⤢** button fits the whole network on screen.
+4. The **Analytics** tab shows live KPIs and charts. Road colours show congestion: green is free-flowing, amber slow, red jammed.
+5. Press **Pause** to freeze, **+1 s** to step, and **Reset** to restart from t = 0 with the same seed.
+
+| Preset | What it shows |
+| --- | --- |
+| Signalised 4-way junction | Two 4-lane arterials, mixed turning traffic, 2-phase signal |
+| Crossing: at-grade (before) | A busy arterial meets a cross street at a signal |
+| Crossing: flyover (after) | The same demand, with the arterial carried over on a flyover |
+| Priority T-junction | Unsignalised junction served first come, first served |
+| Lane-drop bottleneck | 3 lanes narrow to 2; zipper merging and queue build-up |
+| City grid (3×3) | Nine signals, a green wave on the main avenue, congestion-aware routing |
+
+### Build your own network
+
+1. **Scenario → Blank canvas.**
+2. Press `R` (Road tool). In the left rail, choose the lanes each way, one-way or not, and the speed limit.
+3. Click to start a road and click again to end it. The tool keeps chaining from the last point; press `Esc` to stop.
+   - Crossing an existing ground road **creates a 4-way junction automatically**.
+   - Ending a road on another road **creates a T-junction**.
+   - Loose ends become **entry/exit points** (green signs).
+4. Press `F` (Flyover tool) and click two ground points at least 80 m apart. The flyover ramps up, crosses everything in between **without creating a junction**, then ramps down.
+5. Press `S` (Signal tool) and click a junction to add a traffic signal.
+6. Press `V` (Select tool) and click a road or junction to inspect and edit it:
+   - **Road:** name, lanes in each direction, lane width, speed limit, and live speed, density and queue.
+   - **Junction:** turn the signal on or off, set green time per phase, yellow, all-red and offset, and see live phase state and per-approach queues.
+   - Drag a node to reshape the network. Press `Delete` to remove what's selected.
+7. Open the **Traffic** tab and click **+ Add** to create flows. For each flow, set:
+   - origin and destination (or "any exit");
+   - entry rate in veh/h (Poisson arrivals);
+   - vehicle mix: cars, two-wheelers, buses, trucks;
+   - desired-speed factor, an optional vehicle cap, and a start time.
+
+   The same tab holds the random **seed**, the **driving side** (left by default, as in India) and the **routing mode** (shortest path or congestion-aware).
+8. Press **Play**.
+
+Any edit rebuilds the network and restarts the simulation from t = 0, and a toast tells you so. `⌘Z` / `Ctrl+Z` undoes.
+
+### Compare two scenarios
+
+1. Click **Compare scenarios** in the top bar.
+2. Choose **A** (baseline) and **B** (alternative). Either can be a preset or *Current*, the network you are editing.
+3. Set the simulated time, the number of replications (seeds) and the first seed.
+4. Click **Run comparison**. Both scenarios run headless in a background Web Worker with the same seeds. You get:
+   - a headline result (average delay A → B);
+   - a metrics table with mean ± standard deviation and the % change (green is better);
+   - overlaid time-series charts.
+
+### Save, share, export
+
+- **Save & share** stores the scenario on the server and copies a link like `…/?s=abc123`. Anyone who opens the link gets the same network, demand and seed.
+- **Export** downloads the scenario as JSON. **Import** loads a JSON file back in.
+
+### Keyboard shortcuts
+
+| Key | Action |
+| --- | --- |
+| `V` / `R` / `F` / `S` / `D` | Select / Road / Flyover / Signal / Delete tool |
+| `Space` | Play / pause |
+| `Esc` | Stop drawing, clear the selection |
+| `Delete` | Delete the selected road or node |
+| `⌘Z` / `Ctrl+Z` | Undo |
+
+---
+
+## 3. Running the tests
+
+```bash
+npm test
+```
+
+Expected output ends with `Tests  55 passed (55)` and takes about 2 seconds. The suites are in `tests/`:
+
+| File | Covers |
+| --- | --- |
+| `vehicles.test.ts` | IDM fixed points, acceleration and speed bounds, trip time, car-following stops, mandatory and discretionary lane changes |
+| `network.test.ts` | Lane counts and sides (left/right traffic), junction setbacks, turn-to-lane rules, conflicts, one-way roads, shortest paths |
+| `junctions.test.ts` | For every preset: no conflicting movements inside a junction together, no overlaps, no starvation, no gridlock |
+| `signals.test.ts` | Phase timing and offsets, one green phase at a time, no entry on red, queue discharge |
+| `flyover.test.ts` | Ground crossings create junctions but flyovers don't; no turning onto the deck; elevation; before/after benefit |
+| `metrics.test.ts` | Vehicle conservation, metric formulas, density, sampling, determinism, scenario validation |
+| `api.test.ts` | Save, list and load scenarios; invalid input; deterministic `/api/simulate` |
+
+To type-check the whole project (frontend, engine, Worker and tests) without building:
+
+```bash
+npx tsc -b
+```
+
+---
+
+## 4. Deploying to Cloudflare
+
+The app deploys as **one Cloudflare Worker**: the built frontend is served as static assets, `/api/*` goes to the Worker code, and saved scenarios live in **Workers KV**. Configuration is in `cloudflare.config.ts` and uses the `cf` CLI (installed as a dev dependency).
+
+1. **Sign in to Cloudflare** (once per machine):
+
+   ```bash
+   npx cf auth login
+   npx cf auth whoami      # should print your account
+   ```
+
+   On a CI server or another machine without a browser, set an API token instead: `export CLOUDFLARE_API_TOKEN=...`.
+
+2. **Optional:** change the Worker name. It decides the URL `https://<name>.<your-subdomain>.workers.dev`. Edit `name` in `cloudflare.config.ts`.
+
+3. **Deploy:**
+
+   ```bash
+   npm run deploy
+   ```
+
+   This runs the test suite and then `cf deploy`, which builds the app and uploads it. On the first deploy it also **creates the KV namespace automatically** for the `SCENARIOS` binding. No manual setup is needed.
+
+4. **Check the deployment.** The deploy prints the URL. Then run:
+
+   ```bash
+   curl https://<your-worker-url>/api/health
+   # {"ok":true,"engine":"agent-based IDM/MOBIL",...}
+   ```
+
+To see live request logs: `npx wrangler tail quest-traffic-simulation`.
+
+---
+
+## 5. Backend API
+
+All endpoints return JSON. Scenario bodies are validated (shape, value ranges, a 512 KB size limit) before anything is stored or run.
+
+| Method | Path | Body | Returns |
+| --- | --- | --- | --- |
+| `GET` | `/api/health` | none | `{ ok, engine, time }` |
+| `POST` | `/api/scenarios` | Scenario JSON | `201 { id, name, createdAt }` |
+| `GET` | `/api/scenarios` | none | `{ scenarios: [{ id, name, createdAt }] }` (30 most recent) |
+| `GET` | `/api/scenarios/:id` | none | Scenario JSON, or `404` |
+| `POST` | `/api/simulate` | `{ scenario, duration?, seed? }` | `{ summary, samples, warnings, duration, seed }` |
+
+`/api/simulate` runs the same engine as the browser, headless on the server. It is capped at 600 simulated seconds per request. Example, using a scenario exported from the app as `my-scenario.json`:
+
+```bash
+curl -X POST https://quest-traffic-simulation.shashank-telkhade.workers.dev/api/simulate \
+  -H 'content-type: application/json' \
+  -d "{\"scenario\": $(cat my-scenario.json), \"duration\": 300, \"seed\": 7}"
+```
+
+The same scenario and seed always return the same `summary`.
+
+---
+
+## 6. Architecture
 
 ```
-src/engine/   Pure TypeScript simulation engine: no DOM, no timers, deterministic
-  types.ts       Serializable Scenario model (network + signals + demand + seed)
-  network.ts     Compiles a scenario into edges, lanes, junction connectors and conflict sets
-  editor.ts      Pure editing operations (auto-junctions, flyovers, splits, deletes)
-  simulation.ts  Agent loop: spawning, IDM, junction control, MOBIL, metrics
-  vehicles.ts    Per-type IDM parameters (car, bus, two-wheeler, truck)
-  signals.ts     Fixed-time signal plans and automatic phase grouping
-  routing.ts     Dijkstra over directed edges; reachability
-  schema.ts      Validation of untrusted scenario JSON (imports and API)
-  presets.ts     Reproducible test and demo scenarios
-src/web/      React UI. Reads engine state and renders it; never moves vehicles itself
-src/worker/   Cloudflare Worker API (KV storage + headless simulation)
-tests/        Vitest suites for the engine and the API
+src/
+├── engine/        Pure TypeScript simulation engine: no DOM, no timers, deterministic
+│   ├── types.ts       Serializable Scenario model (network + signals + demand + seed)
+│   ├── network.ts     Compiles a scenario into edges, lanes, junction connectors, conflict sets
+│   ├── editor.ts      Pure editing operations (auto-junctions, flyovers, splits, deletes)
+│   ├── simulation.ts  Agent loop: spawning, IDM, junction control, MOBIL, metrics
+│   ├── vehicles.ts    Per-type IDM parameters (car, bus, two-wheeler, truck)
+│   ├── signals.ts     Fixed-time signal plans, automatic phase grouping
+│   ├── routing.ts     Dijkstra over directed edges, reachability
+│   ├── schema.ts      Validation of untrusted scenario JSON (imports, API)
+│   └── presets.ts     Reproducible demo and test scenarios
+├── web/           React frontend: renders engine state, never moves vehicles itself
+│   ├── App.tsx        Layout, scenario state, undo, save/share
+│   ├── MapView.tsx    Canvas, editor tools, fixed-step simulation loop
+│   ├── renderer.ts    Canvas drawing (roads, decks, signals, vehicles, overlays)
+│   ├── Inspector.tsx, TrafficPanel.tsx, Analytics.tsx, Compare.tsx
+│   └── compare.worker.ts  Headless runs for scenario comparison (Web Worker)
+└── worker/
+    └── index.ts   Cloudflare Worker API (KV storage + headless simulation)
+tests/             Vitest suites
+cloudflare.config.ts   Worker, static assets and KV binding
 ```
 
-The engine advances in fixed 0.1 s steps. The browser decides only how many steps to run per animation frame (the speed multiplier), then draws vehicle poses the engine computed. No motion is interpolated or animated in the frontend. The same `runScenario()` function powers tests, the comparison worker and the server API.
+**Separation of simulation and rendering.** The engine advances in fixed 0.1 s steps. The browser only decides how many steps to run per animation frame (the speed multiplier) and then draws the vehicle poses the engine computed. No motion is interpolated or animated in the frontend. One function, `runScenario()`, powers the tests, the comparison worker and the server API.
 
-## Simulation model
+**Tech stack:** TypeScript, React 19, Vite 8, Canvas 2D, Vitest, Cloudflare Workers + Workers KV. There are no runtime dependencies beyond React.
 
-* **Network compilation.** Each road direction becomes an *edge* with one *lane* per lane count. Lanes are offset from the centre line on the driving side (left-hand traffic by default, configurable). Lanes stop short of junctions by a setback that depends on road widths and approach angles. Each junction gets *connectors*: Bézier movements from incoming to outgoing lanes, with U-turns excluded. Lane-use rules: kerb-side turns leave from the outer lane, far-side turns from the inner lane, and through movements from every lane.
-* **Conflicts.** Two movements conflict if they merge into the same lane or their swept paths come within 2 m of each other. Movements that only share an origin lane don't conflict; their vehicles simply follow each other.
-* **Flyovers.** Nodes have a level (ground or elevated), and roads connect only at shared nodes. The editor splits only roads on the same level. A deck that crosses a ground road geometrically therefore has no connector with it, no conflict, and no false intersection. Ramps raise the drawn elevation gradually.
-* **Car following.** The Intelligent Driver Model (Treiber, Hennecke & Helbing, 2000). The leader is found along the vehicle's own path across segment boundaries. Red lights, ungranted junctions and wrong-lane lane ends act as virtual stopped obstacles. Vehicles slow for tight turns, with speed limited by lateral acceleration.
-* **Junction control.** Vehicles near a stop line request their movement. Requests are served first come, first served, subject to:
-  * the signal (red never requests; on yellow, a vehicle goes only if it cannot stop comfortably);
-  * no conflict with movements already granted or occupied;
-  * room on the exit lane, so vehicles don't block the box.
+---
 
-  A blocked earlier request reserves its movement, which prevents starvation. The same mechanism makes unsignalised junctions behave as priority-free "first come" intersections.
-* **Lane changes.** MOBIL (Kesting, Treiber & Helbing, 2007) with a politeness factor and safe-braking checks. Mandatory changes steer vehicles into a lane that serves their next movement. A vehicle that still misses its lane re-routes from where it is.
-* **Demand and routing.** Arrivals are seeded Poisson. Each driver's desired speed comes from the vehicle type, the flow factor and a personal N(1, 0.08) multiplier. Routes are the shortest free-flow time, or, with congestion-aware routing, use an exponentially smoothed estimate of observed travel time on each edge.
-* **Determinism.** All randomness goes through one seeded PRNG (mulberry32), and agents update in a fixed order. The same scenario and seed give bit-identical results; a test checks this.
+## 7. Simulation model
 
-## Metrics
+- **Network compilation.** Each road direction becomes an *edge* with one *lane* per lane count. Lanes are offset to the driving side; left-hand traffic is the default and can be changed. Lanes stop short of junctions by a setback based on road widths and approach angles. Junctions get *connectors*: Bézier movements from incoming to outgoing lanes, with no U-turns. Lane-use rules: kerb-side turns leave from the outer lane, far-side turns from the inner lane, and through movements from any lane.
+- **Conflicts.** Two movements conflict if they merge into the same lane or their swept paths come within 2 m of each other.
+- **Flyovers.** Nodes have a level (ground or elevated), and roads only connect at shared nodes. The editor only splits roads on the same level. A deck crossing a ground road therefore has no connector with it, no conflict and no false intersection. Ramps raise the drawn elevation gradually.
+- **Car following.** The Intelligent Driver Model (Treiber, Hennecke & Helbing, 2000). The leader is found along the vehicle's own path, across segment boundaries. Red lights, ungranted junctions and wrong-lane lane ends act as virtual stopped obstacles. Vehicles slow for tight turns.
+- **Junction control.** Vehicles near a stop line request their movement. Requests are served first come, first served, subject to:
+  - the signal (red: wait; yellow: go only if unable to stop comfortably);
+  - no conflict with movements already granted or occupied;
+  - room on the exit lane (no blocking the box).
+
+  A blocked earlier request reserves its movement, which prevents starvation.
+- **Lane changes.** MOBIL (Kesting, Treiber & Helbing, 2007) with politeness and safe-braking checks. Mandatory changes move vehicles into a lane that serves their next turn. A vehicle that still misses its lane re-routes from where it is.
+- **Demand and routing.** Arrivals are seeded Poisson. Each driver's desired speed comes from the vehicle type, the flow factor and a personal N(1, 0.08) multiplier. Routes use the shortest free-flow time or, optionally, an exponentially smoothed estimate of observed travel time on each edge.
+- **Determinism.** All randomness goes through one seeded PRNG (mulberry32), and agents update in a fixed order. The same scenario and seed give bit-identical results.
+
+---
+
+## 8. Metrics
 
 | Metric | Definition |
 | --- | --- |
@@ -65,20 +286,16 @@ The engine advances in fixed 0.1 s steps. The browser decides only how many step
 | Density | Vehicles per km per lane, per link and network-wide |
 | Time stopped | Share of vehicle-time spent below 0.5 m/s |
 
-## Validation
+---
 
-`npm test` runs 55 tests covering:
+## 9. Validation and results
 
-* **Vehicle movement:** IDM fixed points; acceleration bounds; speed limits; trip time; follower stops behind a stopped leader at about the minimum gap.
-* **Road connectivity:** lane counts and sides for left- and right-hand traffic; setbacks; turn-to-lane assignment; one-way streets; shortest path; reachability.
-* **Intersections:** for every preset over 400 s, no two conflicting movements are occupied at once and no vehicle overlaps another; no starvation at an unsignalised T; no gridlock; all turn types are used.
-* **Traffic signals:** phase sequencing and offsets; never two phases green at once; no vehicle admitted on red (only clearance during all-red); queue discharge.
-* **Flyovers:** a ground crossing creates a junction, but a flyover does not, in either drawing order; ground traffic can't turn onto the deck; vehicles are seen at ground, ramp and deck elevations.
-* **Metrics and reproducibility:** conservation (spawned = completed + active); the throughput, travel time and speed formulas; density; time-series sampling; same seed gives identical results; validator round-trip; API save, load and simulate.
+For every preset over 400 simulated seconds:
+- no two conflicting movements are ever inside a junction at the same time;
+- no vehicles overlap;
+- **zero safety interventions:** the hard non-overlap clamp never has to act, because IDM and junction control keep vehicles apart by themselves.
 
-All presets run with **zero safety interventions**: the hard non-overlap clamp never has to act, because IDM and junction control keep vehicles apart by themselves.
-
-Example comparison (built into the Compare view): the same demand (2,100 veh/h on the arterial, 840 veh/h on the cross street), 15 minutes, 3 seeds:
+**Before vs after a flyover** (built into the Compare view). Same demand: 2,100 veh/h on the arterial and 840 veh/h on the cross street. 15 simulated minutes, 3 seeds:
 
 | | At-grade signal | Flyover |
 | --- | --- | --- |
@@ -87,31 +304,26 @@ Example comparison (built into the Compare view): the same demand (2,100 veh/h o
 | Average trip speed | 33.5 km/h | 42.7 km/h (+27%) |
 | Average total queue | 48.6 m | 0 m |
 
-Throughput is essentially unchanged (+1%) because demand is below capacity in both designs; the flyover removes delay and queues rather than adding capacity.
+Throughput is essentially unchanged (+1%) because demand is below capacity in both designs. The flyover removes delay and queues rather than adding capacity.
 
-## Running locally
+---
 
-```bash
-npm install
-npm run dev        # cf dev: Vite + the Worker API at http://localhost:5173
-npm test           # engine + API tests
-npm run build      # typecheck + production build
-npm run deploy     # tests, then cf deploy (Cloudflare Workers + static assets + KV)
-```
+## 10. Troubleshooting
 
-## API
+| Problem | Fix |
+| --- | --- |
+| `npm install` warns that `workerd` install scripts were skipped | Run `npm install-scripts approve workerd`, then `npm install` again. `npm run dev` needs the `workerd` binary. |
+| `Cannot use import statement outside a module` | Use Node 22.18+ and keep `"type": "module"` in `package.json`. |
+| Port 5173 already in use | `npx cf dev --port 5180` |
+| "Save & share" fails locally | Start the app with `npm run dev`, not `vite` alone; the API runs inside the Cloudflare dev server. |
+| `cf deploy` asks you to sign in | Run `npx cf auth login`, or set `CLOUDFLARE_API_TOKEN`. |
+| The simulation restarted unexpectedly | Any edit to the network, traffic or signals rebuilds the simulation from t = 0 so results stay reproducible. |
 
-```
-GET  /api/health
-POST /api/scenarios          body: Scenario JSON → { id, name, createdAt }
-GET  /api/scenarios          recently saved scenarios
-GET  /api/scenarios/:id      a saved scenario
-POST /api/simulate           { scenario, duration ≤ 600, seed? } → { summary, samples, warnings }
-```
+---
 
-## Limitations and next steps
+## 11. Limitations and next steps
 
-* Signals are fixed-time. Actuated or adaptive control, such as max-pressure, would plug into `lightFor`.
-* Roads are straight segments between nodes; draw a curve as a chain of segments.
-* Two-wheelers follow lane discipline. Lane filtering, which is common in Indian traffic, is not modelled.
-* There is one elevated level, so two decks crossing each other create a junction on the deck.
+- Signals are fixed-time. Actuated or adaptive control, such as max-pressure, would plug into `lightFor` in `signals.ts`.
+- Roads are straight segments between nodes; draw a curve as a chain of segments.
+- Two-wheelers keep lane discipline. Lane filtering, common in Indian traffic, is not modelled.
+- There is one elevated level, so two decks crossing each other create a junction on the deck.
