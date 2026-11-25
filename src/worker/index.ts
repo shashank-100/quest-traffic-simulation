@@ -42,11 +42,10 @@ async function readJson(req: Request): Promise<unknown> {
 }
 
 class HttpError extends Error {
-  constructor(
-    readonly status: number,
-    message: string,
-  ) {
+  readonly status: number;
+  constructor(status: number, message: string) {
     super(message);
+    this.status = status;
   }
 }
 
@@ -86,9 +85,8 @@ async function handle(req: Request, env: Env): Promise<Response> {
     const scenario = parseScenario(body?.scenario ?? body);
     if (typeof body?.seed === 'number') scenario.seed = Math.max(0, Math.round(body.seed));
     const duration = Math.min(MAX_SIM_SECONDS, Math.max(10, Number(body?.duration ?? scenario.duration) || 0));
-    const t0 = Date.now();
     const result = runScenario(scenario, duration);
-    return json({ scenario: scenario.name, seed: scenario.seed, duration, wallMs: Date.now() - t0, summary: result.summary, warnings: result.warnings, samples: result.samples });
+    return json({ scenario: scenario.name, seed: scenario.seed, duration, summary: result.summary, warnings: result.warnings, samples: result.samples });
   }
 
   return fail(404, 'Not found');

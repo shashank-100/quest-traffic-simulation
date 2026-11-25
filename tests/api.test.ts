@@ -18,7 +18,7 @@ function memoryKv() {
 
 const env = () => ({ SCENARIOS: memoryKv() }) as never;
 const call = (e: never, path: string, init?: RequestInit) =>
-  worker.fetch!(new Request(`https://test${path}`, init) as never, e, {} as never) as Promise<Response>;
+  worker.fetch(new Request(`https://test${path}`, init) as never, e) as Promise<Response>;
 
 describe('backend API', () => {
   it('saves, lists and loads scenarios', async () => {
