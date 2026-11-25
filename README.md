@@ -17,7 +17,7 @@ git clone https://github.com/shashank-100/quest-traffic-simulation.git
 cd quest-traffic-simulation
 npm install
 npm run dev        # app + API at http://localhost:5173
-npm test           # 76 tests
+npm test           # 82 tests
 npm run build      # typecheck + production build
 ```
 
@@ -40,6 +40,7 @@ npm run build      # typecheck + production build
 - **Engine (`src/engine`):** pure TypeScript with fixed 0.1 s steps and a seeded random generator, so the same seed always gives the same result. The UI only draws what the engine computes; the same engine powers the tests, the Compare view (in a Web Worker) and `POST /api/simulate`.
 - **Vehicles:** each vehicle (car, two-wheeler, bus, truck) is an independent agent with position, speed, acceleration and route.
   - **Following:** the Intelligent Driver Model (IDM), with the improved free-road term (IIDM) when above desired speed.
+  - **Turns:** each vehicle plans for the junction curves on its route whatever the signal shows. Its desired speed is capped at the speed from which it can still brake comfortably to each curve's safe speed, so it accelerates between turns and brakes late and smoothly into them.
   - **Lane changes:** MOBIL, plus mandatory changes into a lane that serves the next turn.
   - **Routing:** shortest path (Dijkstra), optionally based on observed travel times.
 - **Lane geometry:**
@@ -47,10 +48,11 @@ npm run build      # typecheck + production build
   - **Width:** follows Highway Capacity Manual (HCM) adjustments, applied to each vehicle's side clearance. Narrow lanes lower desired speed (−10% at 3.0 m) and lengthen the desired headway (factor 1 + (W − 3.6)/9).
 - **Junctions:**
   - **Simple connections:** nodes with no signal and no crossing or merging movements, such as flyover deck joints and bends. Vehicles drive straight through.
-  - **Intersections:** vehicles request their movement within a request zone and are served first come, first served. A request is refused if it crosses a movement already in use or would leave the vehicle stuck in the junction. Merging traffic uses gap acceptance.
+  - **Intersections:** vehicles request their movement within a request zone. A request is refused if it crosses a movement already in use or would leave the vehicle stuck in the junction. Merging traffic uses gap acceptance.
+  - **Priority:** at unsignalised junctions the main road (more lanes, then higher speed limit, else the straight-through pair) has right of way. Side-road vehicles give way: they enter only when the gap between successive conflicting main-road vehicles is at least the HCM critical gap (6.2 s kerb-side turn, 6.5 s straight across, 7.1 s turn across traffic) and they can clear the junction before the next one arrives. Symmetric junctions are first come, first served.
   - **Signals:**
     - On yellow, a vehicle may enter only if it will reach the line before red.
-    - On red, nobody enters, and any earlier permission is withdrawn.
+    - On red, nobody enters, and any earlier permission is withdrawn, except from a vehicle that can no longer stop before the line even at full braking. The yellow rule prevents that situation; in tests no vehicle ever entered on red.
 - **Flyovers:** roads only meet at shared nodes on the same level, so a deck never creates a false intersection. Ramps climb 6 m, and the slope reduces how hard vehicles can accelerate.
 
 ## Results
@@ -76,9 +78,13 @@ npm run build      # typecheck + production build
 | Average travel time | 86.8 s | 64.6 s | −26% |
 | Average trip speed | 31.1 km/h | 41.6 km/h | +34% |
 | Average total queue | 60.5 m | 0 m | −100% |
-| Steady-state throughput (300–900 s) | ≈ 2,940 veh/h | ≈ 2,940 veh/h | none: both carry the full demand |
+| Throughput (after warm-up) | 2,882 ± 66 veh/h | 2,959 ± 68 veh/h | within noise: both carry the 2,940 veh/h demand |
 
-Demand (2,940 veh/h) is below capacity in both designs, so the flyover doesn't add throughput; it removes delay and queues. Delay is measured against the same driver alone on the empty network, simulated with identical dynamics (slowing for turns, ramps, lane widths). A lone vehicle therefore has exactly zero delay on every route, so the flyover's remaining 3.9 s comes entirely from vehicles interacting.
+Demand is below capacity in both designs, so the flyover doesn't add throughput; it removes delay and queues.
+
+**Metrics:**
+- **Delay** compares each trip with the same driver alone on the empty network, simulated with the same dynamics (turns, ramps, lane widths). A lone vehicle has zero delay on every route, and no trip beats its reference by more than half a time step, so the flyover's remaining 3.9 s is entirely vehicles interacting.
+- **Throughput** excludes a warm-up equal to the longest free-flow trip time, about 100 s here, during which the network is still filling.
 
 **Safety and robustness:** every preset was run for 30 minutes on several seeds. In every run:
 - no crossing movements were ever inside a junction together;
@@ -98,7 +104,7 @@ Demand (2,940 veh/h) is below capacity in both designs, so the flyover doesn't a
 
 ## Limitations
 
-- **Signals:** fixed-time only. Unsignalised junctions have no main-road priority.
+- **Signals:** fixed-time only. Turns that cut across oncoming traffic at a signal are served first come, first served rather than yielding.
 - **Lane width at signals:** changes discharge by about 1%, against about 7% in the HCM.
 - **Two-wheelers:** stay in lanes; filtering between lanes isn't modelled.
 - **Elevation:** there is only one elevated level.

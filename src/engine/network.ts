@@ -101,6 +101,11 @@ export interface CompiledNode {
   signal: SignalDef | null;
   /** roadId → phase indices in which that approach has green. */
   phaseOfRoad: Map<string, number[]>;
+  /**
+   * At an unsignalised intersection, the roads that form the main road: their traffic has right of
+   * way and every other approach yields. Empty means no road has priority (first come, first served).
+   */
+  majorRoads: Set<string>;
 }
 
 export interface Network {
@@ -200,6 +205,7 @@ export function buildNetwork(scenario: Scenario): Network {
       connectors: [],
       signal: null,
       phaseOfRoad: new Map(),
+      majorRoads: new Set(),
     });
   }
 
@@ -380,6 +386,7 @@ export function buildNetwork(scenario: Scenario): Network {
       return c.conflicts.length > 0 || c.merges.length > 0;
     });
     if (node.degree >= 2) node.control = signalised || interacting ? 'intersection' : 'connection';
+    if (node.control === 'intersection' && !signalised) node.majorRoads = mainRoad(node, roads);
     if (sig && signalised) {
       node.signal = sig;
       sig.phases.forEach((ph, i) => {
@@ -414,6 +421,27 @@ export function buildNetwork(scenario: Scenario): Network {
     exitEdges,
     warnings,
   };
+}
+
+/**
+ * The main road through an unsignalised intersection. Roads rank by number of lanes, then speed
+ * limit; the top-ranked roads are the main road if they are fewer than all approaches. When two
+ * or more roads tie at the top, the main road is the one pair among them that continues straight
+ * through (within 30° of opposite), e.g. the top of a T. Otherwise no road has priority.
+ */
+function mainRoad(node: CompiledNode, roads: Map<string, RoadDef>): Set<string> {
+  const at = node.roads.map((r) => ({ ...r, def: roads.get(r.roadId)! }));
+  const rank = (r: RoadDef) => (r.lanesFwd + r.lanesBwd) * 1000 + r.speedLimit;
+  const best = Math.max(...at.map((r) => rank(r.def)));
+  const top = at.filter((r) => Math.abs(rank(r.def) - best) < 1e-9);
+  if (top.length <= 2 && top.length < at.length) return new Set(top.map((r) => r.roadId));
+  const straight: [string, string][] = [];
+  for (let i = 0; i < top.length; i++) {
+    for (let j = i + 1; j < top.length; j++) {
+      if (Math.abs(Math.abs(angleDiff(top[i].angle, top[j].angle)) - Math.PI) < Math.PI / 6) straight.push([top[i].roadId, top[j].roadId]);
+    }
+  }
+  return straight.length === 1 ? new Set(straight[0]) : new Set();
 }
 
 /**

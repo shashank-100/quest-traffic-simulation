@@ -18,7 +18,10 @@ describe('simulation metrics', () => {
     sim.run(400);
     const s = sim.summary();
     const total = sim.trips.reduce((a, t) => a + t.travelTime, 0);
-    expect(s.throughputPerHour).toBeCloseTo((sim.trips.length / 400) * 3600, 6);
+    expect(s.warmup).toBeGreaterThan(0);
+    expect(s.warmup).toBeLessThanOrEqual(200);
+    expect(s.warmup).toBeCloseTo(Math.min(200, Math.max(...sim.trips.map((t) => t.freeFlowTime))), 9);
+    expect(s.throughputPerHour).toBeCloseTo((sim.trips.filter((t) => t.exitT > s.warmup).length / (400 - s.warmup)) * 3600, 6);
     expect(s.avgTravelTime).toBeCloseTo(total / sim.trips.length, 6);
     expect(s.avgTripSpeed).toBeCloseTo(sim.trips.reduce((a, t) => a + t.distance, 0) / total, 6);
     expect(s.avgDelay).toBeGreaterThan(0);

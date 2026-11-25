@@ -16,7 +16,7 @@ const METRICS: Metric[] = [
   { key: 'avgTravelTime', label: 'Average travel time', unit: 's', better: 'lower', digits: 1 },
   { key: 'avgDelay', label: 'Average delay', unit: 's/veh', better: 'lower', digits: 1 },
   { key: 'avgTripSpeed', label: 'Average trip speed', unit: 'km/h', better: 'higher', scale: kmh, digits: 1 },
-  { key: 'throughputPerHour', label: 'Throughput', unit: 'veh/h', better: 'higher' },
+  { key: 'throughputPerHour', label: 'Throughput (after warm-up)', unit: 'veh/h', better: 'higher' },
   { key: 'completed', label: 'Trips completed', unit: '', better: 'higher' },
   { key: 'avgQueueLength', label: 'Average total queue', unit: 'm', better: 'lower', digits: 1 },
   { key: 'maxQueueLength', label: 'Longest queue', unit: 'm', better: 'lower' },

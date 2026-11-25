@@ -215,7 +215,18 @@ function NodeInspector({ sim, scenario, nodeId, labels, onEdit, onSelect, onAddF
             </label>
           }
         >
-          {!sig && <p className="note">Unsignalised: movements are served first come, first served, and only when they don't conflict with vehicles already in the junction.</p>}
+          {!sig &&
+            (cn.majorRoads.size > 0 ? (
+              <p className="note">
+                Unsignalised, with a main road: <b>{[...cn.majorRoads].map((r) => roadLabel(scenario, r)).join(' and ')}</b> has right of way. Side-road traffic gives way and
+                enters only when the gap in conflicting main-road traffic is at least its critical gap (6.2 s kerb-side turn, 6.5 s straight across, 7.1 s turn across traffic).
+              </p>
+            ) : (
+              <p className="note">
+                Unsignalised, no main road (all approaches equal): movements are served first come, first served, and only when they don't conflict with vehicles already in the
+                junction.
+              </p>
+            ))}
           {sig && status && (
             <>
               <div className="phase-now">
