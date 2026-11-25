@@ -1,5 +1,6 @@
 import {
   lightFor,
+  segmentIntersection,
   rightNormal,
   scale,
   norm,
@@ -77,6 +78,42 @@ export function fitCamera(net: Network, w: number, h: number): Camera {
   const zoom = Math.min((w - padX) / Math.max(1, maxX - minX), (h - padY) / Math.max(1, maxY - minY), 6);
   return { x: (minX + maxX) / 2, y: (minY + maxY) / 2, zoom: Math.max(0.2, zoom) };
 }
+
+/** Metres of approach road kept in view around each junction: room for a typical signal queue. */
+const FOCUS_APPROACH = 120;
+
+/**
+ * Opening view: frame where traffic interacts, with FOCUS_APPROACH metres of road around it, so
+ * vehicles are large enough to see. That is the intersections; failing that, the points where a
+ * flyover passes over another road; failing both, the whole network. Never zooms out further than
+ * fitting the whole network.
+ */
+export function focusCamera(net: Network, w: number, h: number): Camera {
+  const whole = fitCamera(net, w, h);
+  const hubs = [...net.nodes.values()].filter((n) => n.control === 'intersection').map((n) => n.pos);
+  if (hubs.length === 0) {
+    const roads = [...net.roads.values()].map((r) => ({ r, a: net.nodes.get(r.from)!.pos, b: net.nodes.get(r.to)!.pos }));
+    for (let i = 0; i < roads.length; i++) {
+      for (let j = i + 1; j < roads.length; j++) {
+        const x = roads[i];
+        const y = roads[j];
+        if ([x.r.from, x.r.to].some((n) => n === y.r.from || n === y.r.to)) continue;
+        const hit = segmentIntersection(x.a, x.b, y.a, y.b);
+        if (hit) hubs.push(hit.point);
+      }
+    }
+  }
+  if (hubs.length === 0) return whole;
+  const minX = Math.min(...hubs.map((p) => p.x)) - FOCUS_APPROACH;
+  const maxX = Math.max(...hubs.map((p) => p.x)) + FOCUS_APPROACH;
+  const minY = Math.min(...hubs.map((p) => p.y)) - FOCUS_APPROACH;
+  const maxY = Math.max(...hubs.map((p) => p.y)) + FOCUS_APPROACH;
+  const zoom = Math.min(w / (maxX - minX), h / (maxY - minY), 6);
+  return { x: (minX + maxX) / 2, y: (minY + maxY) / 2, zoom: Math.max(whole.zoom, zoom) };
+}
+
+/** Smallest on-screen vehicle size in pixels, so traffic stays visible when zoomed out. */
+const MIN_VEHICLE_PX = { length: 7, width: 3 };
 
 function laneElevated(l: Lane): boolean {
   return l.levelFrom > 0 || l.levelTo > 0;
@@ -293,8 +330,8 @@ function drawVehicles(ctx: CanvasRenderingContext2D, sim: Simulation, include: (
     if (!include(v)) continue;
     const pose = sim.pose(v);
     const k = 1 + 0.06 * pose.level;
-    const L = v.p.length * k;
-    const W = v.p.width * k;
+    const L = Math.max(v.p.length * k, MIN_VEHICLE_PX.length * px);
+    const W = Math.max(v.p.width * k, MIN_VEHICLE_PX.width * px);
     ctx.save();
     ctx.translate(pose.x, pose.y);
     ctx.rotate(pose.heading);

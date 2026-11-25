@@ -12,7 +12,7 @@ import {
   type Simulation,
   type Vec,
 } from '../engine';
-import { fitCamera, hitTest, render, screenToWorld, type Camera } from './renderer';
+import { fitCamera, focusCamera, hitTest, render, screenToWorld, type Camera } from './renderer';
 
 export type Tool = 'select' | 'road' | 'flyover' | 'signal' | 'delete';
 export type Selection = { kind: 'road' | 'node'; id: string } | null;
@@ -49,12 +49,60 @@ export function MapView(p: Props) {
   const hover = useRef<Selection>(null);
   const drag = useRef<{ mode: 'pan' | 'node'; start: Vec; cam: Camera; nodeId?: string; moved: boolean; pointer: number } | null>(null);
   const [hint, setHint] = useState('');
+  /** Active touch/pen/mouse pointers in screen coordinates, for two-finger pinch zoom. */
+  const pointers = useRef(new Map<number, Vec>());
+  const pinch = useRef<{ dist: number; cam: Camera; anchor: Vec } | null>(null);
+
+  /** Zoom by factor k keeping the world point under screen point sp fixed. */
+  const zoomAt = (sp: Vec, k: number) => {
+    const r = canvasRef.current!.getBoundingClientRect();
+    const before = screenToWorld(cam.current, r.width, r.height, sp);
+    const zoom = Math.max(0.15, Math.min(12, cam.current.zoom * k));
+    const next = { ...cam.current, zoom };
+    const after = screenToWorld(next, r.width, r.height, sp);
+    cam.current = { ...next, x: next.x + before.x - after.x, y: next.y + before.y - after.y };
+  };
+
+  // Wheel and trackpad pinch zoom the map, never the page. React registers wheel listeners as
+  // passive, which cannot cancel the browser's own Ctrl+wheel (pinch) page zoom, so these are
+  // native, non-passive listeners. Safari reports trackpad pinch as gesture events instead.
+  useEffect(() => {
+    const c = canvasRef.current!;
+    const local = (e: { clientX: number; clientY: number }) => {
+      const r = c.getBoundingClientRect();
+      return { x: e.clientX - r.left, y: e.clientY - r.top };
+    };
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      // Pinch arrives as small Ctrl+wheel deltas; a mouse wheel as larger plain ones.
+      zoomAt(local(e), Math.exp(-e.deltaY * (e.ctrlKey ? 0.01 : 0.0015)));
+    };
+    let gestureScale = 1;
+    const onGestureStart = (e: Event) => {
+      e.preventDefault();
+      gestureScale = 1;
+    };
+    const onGestureChange = (e: Event) => {
+      e.preventDefault();
+      const g = e as Event & { scale: number; clientX: number; clientY: number };
+      zoomAt(local(g), g.scale / gestureScale);
+      gestureScale = g.scale;
+    };
+    c.addEventListener('wheel', onWheel, { passive: false });
+    c.addEventListener('gesturestart', onGestureStart);
+    c.addEventListener('gesturechange', onGestureChange);
+    return () => {
+      c.removeEventListener('wheel', onWheel);
+      c.removeEventListener('gesturestart', onGestureStart);
+      c.removeEventListener('gesturechange', onGestureChange);
+    };
+  }, []);
 
   // Fit view when a new scenario is loaded.
   useEffect(() => {
     const c = canvasRef.current!;
     const r = c.getBoundingClientRect();
-    cam.current = fitCamera(p.sim.net, r.width, r.height);
+    cam.current = focusCamera(p.sim.net, r.width, r.height);
     draft.current = null;
   }, [p.fitKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -218,9 +266,25 @@ export function MapView(p: Props) {
     }
   };
 
+  const screenPoint = (e: { clientX: number; clientY: number }): Vec => {
+    const r = canvasRef.current!.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  };
+
   const onPointerDown = (e: React.PointerEvent) => {
     const c = canvasRef.current!;
     c.setPointerCapture(e.pointerId);
+    pointers.current.set(e.pointerId, screenPoint(e));
+    if (pointers.current.size === 2) {
+      // Second finger down: pinch replaces any pan or drag in progress.
+      const [a, b] = [...pointers.current.values()];
+      const r = c.getBoundingClientRect();
+      const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+      pinch.current = { dist: Math.hypot(a.x - b.x, a.y - b.y), cam: { ...cam.current }, anchor: screenToWorld(cam.current, r.width, r.height, mid) };
+      drag.current = null;
+      return;
+    }
+    if (pinch.current) return;
     if (e.button === 2) {
       draft.current = null;
       return;
@@ -238,6 +302,17 @@ export function MapView(p: Props) {
   };
 
   const onPointerMove = (e: React.PointerEvent) => {
+    if (pointers.current.has(e.pointerId)) pointers.current.set(e.pointerId, screenPoint(e));
+    const pz = pinch.current;
+    if (pz && pointers.current.size === 2) {
+      const [a, b] = [...pointers.current.values()];
+      const r = canvasRef.current!.getBoundingClientRect();
+      const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+      const zoom = Math.max(0.15, Math.min(12, pz.cam.zoom * (Math.hypot(a.x - b.x, a.y - b.y) / Math.max(1, pz.dist))));
+      // Keep the world point that started under the fingers' midpoint under it.
+      cam.current = { zoom, x: pz.anchor.x - (mid.x - r.width / 2) / zoom, y: pz.anchor.y - (mid.y - r.height / 2) / zoom };
+      return;
+    }
     const w = toWorld(e);
     cursor.current = w;
     const cur = props.current;
@@ -262,6 +337,13 @@ export function MapView(p: Props) {
   };
 
   const onPointerUp = (e: React.PointerEvent) => {
+    pointers.current.delete(e.pointerId);
+    if (pinch.current) {
+      // A pinch never ends in a click; wait until every finger has lifted.
+      if (pointers.current.size === 0) pinch.current = null;
+      drag.current = null;
+      return;
+    }
     const d = drag.current;
     drag.current = null;
     if (e.button === 2) return;
@@ -273,18 +355,9 @@ export function MapView(p: Props) {
     click(toWorld(e));
   };
 
-  const onWheel = (e: React.WheelEvent) => {
-    const r = canvasRef.current!.getBoundingClientRect();
-    const sp = { x: e.clientX - r.left, y: e.clientY - r.top };
-    const before = screenToWorld(cam.current, r.width, r.height, sp);
-    const zoom = Math.max(0.15, Math.min(12, cam.current.zoom * Math.exp(-e.deltaY * 0.0015)));
-    cam.current = { ...cam.current, zoom };
-    const after = screenToWorld(cam.current, r.width, r.height, sp);
-    cam.current = { ...cam.current, x: cam.current.x + before.x - after.x, y: cam.current.y + before.y - after.y };
-  };
-
   const zoomBy = (k: number) => {
-    cam.current = { ...cam.current, zoom: Math.max(0.15, Math.min(12, cam.current.zoom * k)) };
+    const r = canvasRef.current!.getBoundingClientRect();
+    zoomAt({ x: r.width / 2, y: r.height / 2 }, k);
   };
   const fit = () => {
     const r = canvasRef.current!.getBoundingClientRect();
@@ -302,7 +375,11 @@ export function MapView(p: Props) {
           cursor.current = null;
           hover.current = null;
         }}
-        onWheel={onWheel}
+        onPointerCancel={(e) => {
+          pointers.current.delete(e.pointerId);
+          if (pointers.current.size === 0) pinch.current = null;
+          drag.current = null;
+        }}
         onContextMenu={(e) => {
           e.preventDefault();
           draft.current = null;
