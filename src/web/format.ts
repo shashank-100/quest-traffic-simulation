@@ -27,7 +27,8 @@ export function endpointLabels(sc: Scenario): Map<string, string> {
     const a = Math.atan2(n.y - cy, n.x - cx);
     const d = dirs[((Math.round(a / (Math.PI / 4)) % 8) + 8) % 8];
     const road = sc.roads.find((r) => r.from === n.id || r.to === n.id);
-    const base = road?.name ? `${d} · ${road.name}` : `${d} end`;
+    const name = road?.name?.replace(/ (flyover )?ramp$/i, '');
+    const base = name ? `${d} · ${name}` : `${d} end`;
     const k = (used.get(base) ?? 0) + 1;
     used.set(base, k);
     out.set(n.id, k > 1 ? `${base} ${k}` : base);

@@ -431,7 +431,7 @@ input[type='range'] {
 }
 .map-hint {
   position: absolute;
-  top: 54px;
+  bottom: 70px;
   left: 50%;
   transform: translateX(-50%);
   max-width: min(560px, calc(100% - 32px));
@@ -1396,7 +1396,7 @@ input[type='range'] {
     justify-content: center;
   }
   .map-hint {
-    top: 64px;
+    bottom: 104px;
   }
   .panel {
     border-left: none;

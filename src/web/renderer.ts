@@ -67,11 +67,14 @@ export function fitCamera(net: Network, w: number, h: number): Camera {
   if (pts.length === 0) return { x: 0, y: 0, zoom: 1.2 };
   const xs = pts.map((p) => p.x);
   const ys = pts.map((p) => p.y);
-  const minX = Math.min(...xs) - 40;
-  const maxX = Math.max(...xs) + 40;
-  const minY = Math.min(...ys) - 40;
-  const maxY = Math.max(...ys) + 40;
-  const zoom = Math.min(w / (maxX - minX), h / (maxY - minY), 6);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+  // Leave room for endpoint signs and the floating controls.
+  const padX = Math.min(300, w * 0.22);
+  const padY = Math.min(170, h * 0.3);
+  const zoom = Math.min((w - padX) / Math.max(1, maxX - minX), (h - padY) / Math.max(1, maxY - minY), 6);
   return { x: (minX + maxX) / 2, y: (minY + maxY) / 2, zoom: Math.max(0.2, zoom) };
 }
 
@@ -258,7 +261,7 @@ function drawCongestion(ctx: CanvasRenderingContext2D, sim: Simulation, lanes: L
     }
     const c = done.get(l.edge)!;
     if (c < 0) continue;
-    strokePath(ctx, l.path.points, l.width * 0.55, congestionColor(c, 0.38), 'butt');
+    strokePath(ctx, l.path.points, l.width * 0.92, congestionColor(c, 0.17), "butt");
   }
   void px;
 }
