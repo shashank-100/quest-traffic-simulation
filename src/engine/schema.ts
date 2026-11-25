@@ -94,15 +94,8 @@ function checkReferences(sc: Scenario): void {
     }
   }
 
-  // An entry point is a dead-end node with a lane leading into the network; an exit has one leading out.
-  const endpoint = (id: string, dir: 'in' | 'out'): boolean => {
-    const at = roadsAt.get(id) ?? [];
-    if (at.length !== 1) return false;
-    const r = at[0];
-    const intoNetwork = r.from === id ? r.lanesFwd : r.lanesBwd;
-    const outOfNetwork = r.from === id ? r.lanesBwd : r.lanesFwd;
-    return (dir === 'in' ? intoNetwork : outOfNetwork) > 0;
-  };
+  const roles = endpointRoles(sc);
+  const endpoint = (id: string, dir: 'in' | 'out'): boolean => (dir === 'in' ? roles.get(id)?.entry : roles.get(id)?.exit) ?? false;
   const nodeIds = new Set(sc.nodes.map((n) => n.id));
   for (const f of sc.flows) {
     const label = `Flow ${f.name ? `"${f.name}"` : f.id}`;
@@ -116,6 +109,22 @@ function checkReferences(sc: Scenario): void {
     if (f.mix.car + f.mix.bus + f.mix.bike + f.mix.truck <= 0) throw new Error(`${label}: vehicle mix is empty`);
     if (f.end < f.start) throw new Error(`${label}: ends before it starts`);
   }
+}
+
+/**
+ * Road ends (nodes with exactly one road) and what traffic can do there: an entry point has a lane
+ * leading into the network, an exit point a lane leading out. A two-way road end is both.
+ */
+export function endpointRoles(sc: Pick<Scenario, 'roads'>): Map<string, { entry: boolean; exit: boolean }> {
+  const roadsAt = new Map<string, RoadDef[]>();
+  for (const r of sc.roads) for (const n of [r.from, r.to]) roadsAt.set(n, [...(roadsAt.get(n) ?? []), r]);
+  const roles = new Map<string, { entry: boolean; exit: boolean }>();
+  for (const [id, at] of roadsAt) {
+    if (at.length !== 1) continue;
+    const r = at[0];
+    roles.set(id, { entry: (r.from === id ? r.lanesFwd : r.lanesBwd) > 0, exit: (r.from === id ? r.lanesBwd : r.lanesFwd) > 0 });
+  }
+  return roles;
 }
 
 function unique(items: { id: string }[], what: string): void {

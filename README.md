@@ -17,7 +17,7 @@ git clone https://github.com/shashank-100/quest-traffic-simulation.git
 cd quest-traffic-simulation
 npm install
 npm run dev        # app + API at http://localhost:5173
-npm test           # 68 tests
+npm test           # 76 tests
 npm run build      # typecheck + production build
 ```
 
@@ -76,9 +76,9 @@ npm run build      # typecheck + production build
 | Average travel time | 86.8 s | 64.6 s | −26% |
 | Average trip speed | 31.1 km/h | 41.6 km/h | +34% |
 | Average total queue | 60.5 m | 0 m | −100% |
-| Throughput | 2,627 veh/h | 2,719 veh/h | +4% |
+| Steady-state throughput (300–900 s) | ≈ 2,940 veh/h | ≈ 2,940 veh/h | none: both carry the full demand |
 
-Throughput barely changes because demand is below capacity in both designs; the flyover removes delay and queues. Delay is measured against the same driver alone on the empty network, simulated with identical dynamics (slowing for turns, ramps, lane widths). A lone vehicle therefore has exactly zero delay on every route, so the flyover's remaining 3.9 s comes entirely from vehicles interacting.
+Demand (2,940 veh/h) is below capacity in both designs, so the flyover doesn't add throughput; it removes delay and queues. Delay is measured against the same driver alone on the empty network, simulated with identical dynamics (slowing for turns, ramps, lane widths). A lone vehicle therefore has exactly zero delay on every route, so the flyover's remaining 3.9 s comes entirely from vehicles interacting.
 
 **Safety and robustness:** every preset was run for 30 minutes on several seeds. In every run:
 - no crossing movements were ever inside a junction together;

@@ -1,5 +1,6 @@
 import { dist, lerp, pointSegmentDistance, segmentIntersection, type Vec } from './geometry';
 import { autoPhases, defaultSignal } from './signals';
+import { endpointRoles } from './schema';
 import type { Level, NodeDef, RoadDef, Scenario } from './types';
 
 /**
@@ -143,6 +144,7 @@ export function addRoad(
   const to = resolvePoint(sc, b, level, snap);
   if (from === to) return { scenario: input, roads: [], from, to };
   const roads = addRoadBetween(sc, from, to, opts, name);
+  reconcileFlows(sc);
   return { scenario: sc, roads, from, to };
 }
 
@@ -173,14 +175,26 @@ export function addFlyover(
     ...addRoadBetween(sc, u1.id, u2.id, opts, name),
     ...addRoadBetween(sc, u2.id, to, opts, `${name} ramp`),
   ];
+  reconcileFlows(sc);
   return { scenario: sc, roads, from, to };
 }
 
 function pruneOrphans(sc: Scenario): void {
   const used = new Set(sc.roads.flatMap((r) => [r.from, r.to]));
   sc.nodes = sc.nodes.filter((n) => used.has(n.id));
-  const ids = new Set(sc.nodes.map((n) => n.id));
-  sc.flows = sc.flows.filter((f) => ids.has(f.origin) && (f.destination === null || ids.has(f.destination)));
+  reconcileFlows(sc);
+}
+
+/**
+ * Keeps traffic consistent with the network after an edit: a flow whose origin is no longer an
+ * entry point (deleted, extended into a through road, or made exit-only) is removed; a flow whose
+ * destination is no longer an exit point falls back to "any exit".
+ */
+function reconcileFlows(sc: Scenario): void {
+  const roles = endpointRoles(sc);
+  sc.flows = sc.flows
+    .filter((f) => roles.get(f.origin)?.entry)
+    .map((f) => (f.destination !== null && !roles.get(f.destination)?.exit ? { ...f, destination: null } : f));
 }
 
 export function removeRoad(input: Scenario, roadId: string): Scenario {
@@ -215,6 +229,7 @@ export function updateRoad(input: Scenario, roadId: string, patch: Partial<RoadD
   const sc = clone(input);
   const r = sc.roads.find((x) => x.id === roadId);
   if (r) Object.assign(r, patch, { id: r.id, from: r.from, to: r.to });
+  reconcileFlows(sc);
   return sc;
 }
 

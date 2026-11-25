@@ -1,5 +1,6 @@
 import {
   autoPhases,
+  endpointRoles,
   removeNode,
   removeRoad,
   setSignal,
@@ -187,16 +188,22 @@ function NodeInspector({ sim, scenario, nodeId, labels, onEdit, onSelect, onAddF
             </>
           )}
         </dl>
-        {cn.isEndpoint && (
-          <>
-            <p className="note">
-              {flows.length ? `${flows.length} flow(s) enter here.` : 'No traffic enters here yet.'} Vehicles routed to this point leave the network here.
-            </p>
-            <button type="button" onClick={() => onAddFlow(nodeId)}>
-              + Add flow from here
-            </button>
-          </>
-        )}
+        {cn.isEndpoint && (() => {
+          const role = endpointRoles(scenario).get(nodeId);
+          return (
+            <>
+              <p className="note">
+                {role?.entry ? (flows.length ? `${flows.length} flow(s) enter here. ` : 'No traffic enters here yet. ') : 'One-way road leaving the network: traffic can only exit here. '}
+                {role?.exit ? 'Vehicles routed to this point leave the network here.' : 'One-way road entering the network: nothing can exit here.'}
+              </p>
+              {role?.entry && (
+                <button type="button" onClick={() => onAddFlow(nodeId)}>
+                  + Add flow from here
+                </button>
+              )}
+            </>
+          );
+        })()}
       </Section>
       {cn.degree >= 3 && (
         <Section

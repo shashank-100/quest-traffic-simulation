@@ -1,4 +1,4 @@
-import { VEHICLE_TYPES, type FlowDef, type Scenario, type Simulation, type VehicleType } from '../engine';
+import { endpointRoles, VEHICLE_TYPES, type FlowDef, type Scenario, type Simulation, type VehicleType } from '../engine';
 import { Field, Section, Slider } from './ui';
 
 interface Props {
@@ -11,11 +11,13 @@ interface Props {
 const TYPE_LABEL: Record<VehicleType, string> = { car: 'Cars', bike: 'Two-wheelers', bus: 'Buses', truck: 'Trucks' };
 
 export function TrafficPanel({ sim, scenario, labels, onEdit }: Props) {
-  const endpoints = [...labels.entries()];
+  const roles = endpointRoles(scenario);
+  const entries = [...labels.entries()].filter(([id]) => roles.get(id)?.entry);
+  const exits = [...labels.entries()].filter(([id]) => roles.get(id)?.exit);
   const setFlow = (id: string, patch: Partial<FlowDef>) =>
     onEdit({ ...scenario, flows: scenario.flows.map((f) => (f.id === id ? { ...f, ...patch } : f)) }, { message: 'Traffic updated' });
   const addFlow = () => {
-    const origin = endpoints.find(([id]) => !scenario.flows.some((f) => f.origin === id))?.[0] ?? endpoints[0]?.[0];
+    const origin = entries.find(([id]) => !scenario.flows.some((f) => f.origin === id))?.[0] ?? entries[0]?.[0];
     if (!origin) return;
     onEdit({ ...scenario, flows: [...scenario.flows, newFlow(scenario, origin)] }, { message: 'Flow added' });
   };
@@ -60,12 +62,14 @@ export function TrafficPanel({ sim, scenario, labels, onEdit }: Props) {
       <Section
         title={`Traffic flows · ${scenario.flows.length}`}
         aside={
-          <button type="button" className="small" onClick={addFlow} disabled={endpoints.length < 2}>
+          <button type="button" className="small" onClick={addFlow} disabled={entries.length === 0 || exits.length === 0}>
             + Add
           </button>
         }
       >
-        {endpoints.length < 2 && <p className="note">Draw roads with at least two loose ends to create entry and exit points.</p>}
+        {(entries.length === 0 || exits.length === 0) && (
+          <p className="note">Draw roads with loose ends: a road end with a lane leading in is an entry point, one with a lane leading out is an exit point.</p>
+        )}
         {scenario.flows.map((f) => {
           const total = VEHICLE_TYPES.reduce((a, k) => a + f.mix[k], 0) || 1;
           return (
@@ -85,7 +89,7 @@ export function TrafficPanel({ sim, scenario, labels, onEdit }: Props) {
               <div className="row2">
                 <Field label="From">
                   <select value={f.origin} onChange={(e) => setFlow(f.id, { origin: e.target.value, destination: f.destination === e.target.value ? null : f.destination })}>
-                    {endpoints.map(([id, l]) => (
+                    {entries.map(([id, l]) => (
                       <option key={id} value={id}>
                         {l}
                       </option>
@@ -95,7 +99,7 @@ export function TrafficPanel({ sim, scenario, labels, onEdit }: Props) {
                 <Field label="To">
                   <select value={f.destination ?? ''} onChange={(e) => setFlow(f.id, { destination: e.target.value || null })}>
                     <option value="">Any exit (random)</option>
-                    {endpoints
+                    {exits
                       .filter(([id]) => id !== f.origin)
                       .map(([id, l]) => (
                         <option key={id} value={id}>

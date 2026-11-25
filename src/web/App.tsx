@@ -70,7 +70,15 @@ export function App() {
       if (!opts?.transient) history.current.push(scenario);
       if (history.current.length > 100) history.current.shift();
       apply(sc);
-      if (opts?.message) notify(opts.message + (sim.t > 0 ? ' · simulation restarted' : ''));
+      // Edits can strand traffic (an entry point extended into a through road, a road made one-way);
+      // the editor removes or redirects those flows, and the user should know.
+      // Only road edits do this; deleting a flow or picking "any exit" by hand is not worth a warning.
+      const roadsEdited = sc.roads !== scenario.roads;
+      const removed = roadsEdited ? scenario.flows.length - sc.flows.length : 0;
+      const redirected = roadsEdited ? sc.flows.filter((f) => f.destination === null && scenario.flows.some((o) => o.id === f.id && o.destination !== null)).length : 0;
+      const note = [removed > 0 && `${removed} flow(s) removed: their entry point is gone`, redirected > 0 && `${redirected} flow(s) now go to any exit`].filter(Boolean).join(' · ');
+      if (note) notify(`${opts?.message ? `${opts.message} · ` : ''}${note}`, 'error');
+      else if (opts?.message) notify(opts.message + (sim.t > 0 ? ' · simulation restarted' : ''));
     },
     [apply, notify, scenario, sim.t],
   );
