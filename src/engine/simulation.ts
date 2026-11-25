@@ -2,7 +2,7 @@ import { buildNetwork, segmentLevel, type Connector, type Lane, type Network, ty
 import { Rng } from './rng';
 import { freeFlowCost, reachableExits, shortestRoute, type EdgeCost } from './routing';
 import { lightFor } from './signals';
-import { idmAccel, VEHICLE_PARAMS, type VehicleParams } from './vehicles';
+import { idmAccel, laneWidthEffect, VEHICLE_PARAMS, type LaneEffect, type VehicleParams } from './vehicles';
 import { rightNormal, scale, norm, sub } from './geometry';
 import type { FlowDef, Scenario, VehicleType } from './types';
 
@@ -12,6 +12,9 @@ const LANE_CHANGE_EVERY = 5; // steps
 const MOBIL_THRESHOLD = 0.25;
 const SAFE_DECEL = 4;
 const QUEUE_SPEED = 2; // m/s below which a vehicle counts as queued
+/** Height of a flyover deck above ground (m); sets ramp gradients. */
+export const DECK_HEIGHT = 6;
+const G = 9.81;
 
 export interface Vehicle {
   id: number;
@@ -132,13 +135,31 @@ export class Simulation {
   private cost: EdgeCost;
   private sideSign: number;
   private exitTimes: number[] = [];
+  /** Per segment, per vehicle type: lane-width effect on desired speed and headway. */
+  private laneEffect: Record<VehicleType, LaneEffect>[];
+  /** Per segment: uphill gradient (rise/run, ≥ 0). */
+  private grade: Float64Array;
   private queueByLane = new Map<number, number>();
+  /** Vehicles on, or granted onto, each connector that has merge partners (rebuilt every step). */
+  private mergeUsers = new Map<number, Vehicle[]>();
+  /** Connectors ending in each lane (indexed by lane segment id). */
+  private connectorsInto: number[][];
 
   constructor(scenario: Scenario) {
     this.scenario = scenario;
     this.net = buildNetwork(scenario);
     this.rng = new Rng(scenario.seed);
     this.occ = this.net.segments.map(() => []);
+    this.connectorsInto = this.net.segments.map(() => []);
+    for (const c of this.net.connectors) this.connectorsInto[c.toLane].push(c.id);
+    this.laneEffect = this.net.segments.map((seg) => {
+      const e = {} as Record<VehicleType, LaneEffect>;
+      for (const k of ['car', 'bus', 'bike', 'truck'] as const) e[k] = laneWidthEffect(seg.width, VEHICLE_PARAMS[k].width);
+      return e;
+    });
+    this.grade = Float64Array.from(this.net.segments, (seg) =>
+      seg.kind === 'lane' && seg.levelTo > seg.levelFrom ? (DECK_HEIGHT * (seg.levelTo - seg.levelFrom)) / seg.length : 0,
+    );
     this.sideSign = scenario.driveSide === 'right' ? 1 : -1;
     const ff = freeFlowCost(this.net);
     this.edgeTT = new Float64Array(this.net.edges.length);
@@ -285,6 +306,28 @@ export class Simulation {
         if (f.s > l.s - l.p.length + 1e-6) out.push(`overlap on segment ${id}: ${f.id} into ${l.id}`);
       }
     }
+    for (const lane of this.net.lanes) {
+      const list = this.occ[lane.id];
+      let waiting = false;
+      for (let i = list.length - 1; i >= 0; i--) {
+        if (list[i].grant === null) waiting = true;
+        else if (waiting) out.push(`vehicle ${list[i].id} holds a grant behind a waiting vehicle on lane ${lane.id}`);
+      }
+    }
+    for (const c of this.net.connectors) {
+      for (const kid of c.merges) {
+        if (kid < c.id) continue;
+        const k = this.net.segments[kid] as Connector;
+        for (const a of this.occ[c.id]) {
+          for (const b of this.occ[kid]) {
+            const da = c.length - a.s;
+            const db = k.length - b.s;
+            // Projected onto the merge point, the two bodies must not overlap.
+            if (da < db + b.p.length - 1e-6 && db < da + a.p.length - 1e-6) out.push(`merging vehicles ${a.id} and ${b.id} overlap at movements ${c.id}/${kid}`);
+          }
+        }
+      }
+    }
     const occupied = new Set<number>();
     for (const v of this.vehicles) if (v.occupying !== null) occupied.add(v.occupying);
     for (const c of occupied) {
@@ -351,10 +394,20 @@ export class Simulation {
       const bestScore = best ? (bestServes ? 1e6 : 0) + Math.min(best.gap, 1e5) : -Infinity;
       if (score > bestScore) best = { lane, gap, leaderV: leader?.v ?? Infinity };
     }
-    if (!best || best.gap < p.minGap + 1) return;
-    let v = Math.min(v0, best.lane.speedLimit);
+    if (!best) return;
+    // Enter the way a vehicle arriving from upstream would: at the leader's speed with an
+    // equilibrium gap, or creeping into a standing queue that has backed up to the entry.
+    const eff = this.laneEffect[best.lane.id][spec.type];
+    const T = p.headway * eff.headway;
+    let v = Math.min(v0 * eff.speed, best.lane.speedLimit);
     if (Number.isFinite(best.gap)) {
-      v = Math.min(v, best.leaderV + 2, Math.max(0, (best.gap - p.minGap) / p.headway));
+      if (best.leaderV >= 3) {
+        v = Math.min(v, best.leaderV);
+        if (best.gap < p.minGap + v * T) return;
+      } else {
+        if (best.gap < p.minGap + 1) return;
+        v = Math.min(v, best.leaderV + 1, Math.max(0, (best.gap - p.minGap) / T));
+      }
     }
     f.backlog.shift();
     const veh: Vehicle = {
@@ -373,7 +426,11 @@ export class Simulation {
       spawnT: this.t,
       entryWait: this.t - spec.requestT,
       dist: 0,
-      freeFlowTime: route.reduce((a, e) => a + this.net.edges[e].length / Math.min(v0, this.net.edges[e].speedLimit), 0),
+      // Free-flow time at this driver's desired speed, including lane-width effects on each edge.
+      freeFlowTime: route.reduce((a, e) => {
+        const edge = this.net.edges[e];
+        return a + edge.length / Math.min(v0 * this.laneEffect[edge.lanes[0]][spec.type].speed, edge.speedLimit);
+      }, 0),
       grant: null,
       occupying: null,
       requestT: -1,
@@ -432,13 +489,20 @@ export class Simulation {
       if (node.isEndpoint) continue;
       const light = lightFor(node, lane.roadId, this.t);
       let pred: Vehicle | null = null;
+      // Walk the lane front to back. A vehicle may only hold a grant while every vehicle ahead of
+      // it on the lane holds one too: grants behind a vehicle that has to wait are withdrawn, or a
+      // stale grant would block crossing traffic that is itself blocking the queue's head.
+      let stop = -1;
       for (let i = list.length - 1; i >= 0; i--) {
         const v = list[i];
         const distance = lane.length - v.s;
-        if (distance > Math.max(30, (v.v * v.v) / (2 * v.p.decel) + 15)) break;
         const c = this.wantedConnector(v);
-        if (c === null) break;
-        if (v.grant === c) {
+        if (distance > Math.max(30, (v.v * v.v) / (2 * v.p.decel) + 15) || c === null) {
+          stop = i;
+          break;
+        }
+        if (v.grant !== null && v.grant !== c) v.grant = null;
+        if (v.grant === c && (pred === null || pred.grant !== null)) {
           // A red light revokes a grant if the vehicle can still stop comfortably.
           if (light === 'red' && this.canStop(v, distance, v.p.decel * 1.5)) v.grant = null;
           else {
@@ -446,22 +510,30 @@ export class Simulation {
             continue;
           }
         }
-        if (light === 'red') break;
-        if (light === 'yellow' && this.canStop(v, distance, v.p.decel)) break;
+        v.grant = null;
+        if (light === 'red' || (light === 'yellow' && this.canStop(v, distance, v.p.decel))) {
+          stop = i - 1;
+          break;
+        }
         if (v.requestT < 0) v.requestT = this.t;
         const list2 = byNode.get(node.id) ?? [];
         list2.push({ v, c: this.net.segments[c] as Connector, pred: pred && pred.grant !== null ? null : pred });
         byNode.set(node.id, list2);
         pred = v;
       }
+      for (let i = stop; i >= 0; i--) list[i].grant = null;
     }
     if (byNode.size === 0) return;
 
     const busyByNode = new Map<string, Set<number>>();
     const pendingByLane = new Map<number, number>();
+    const usersOf = new Map<number, Vehicle[]>();
     for (const v of this.vehicles) {
       for (const c of [v.grant, v.occupying]) {
         if (c === null) continue;
+        const users = usersOf.get(c) ?? [];
+        users.push(v);
+        usersOf.set(c, users);
         const conn = this.net.segments[c] as Connector;
         const set = busyByNode.get(conn.node) ?? new Set<number>();
         set.add(c);
@@ -477,7 +549,11 @@ export class Simulation {
       const reserved = new Set<number>();
       for (const { v, c, pred } of cands) {
         if (pred && pred.grant === null) continue;
-        if (c.conflicts.some((k) => busy.has(k) || reserved.has(k))) {
+        const blocked =
+          c.conflicts.some((k) => busy.has(k) || reserved.has(k)) ||
+          c.merges.some((k) => reserved.has(k)) ||
+          !this.mergeClear(v, c, usersOf);
+        if (blocked) {
           reserved.add(c.id);
           continue;
         }
@@ -485,9 +561,70 @@ export class Simulation {
         if (this.laneRoom(c.toLane) - pending < v.p.length + v.p.minGap) continue;
         v.grant = c.id;
         busy.add(c.id);
+        const users = usersOf.get(c.id) ?? [];
+        users.push(v);
+        usersOf.set(c.id, users);
         pendingByLane.set(c.toLane, pending + v.p.length + v.p.minGap);
       }
     }
+  }
+
+  /**
+   * Distance from a vehicle's front bumper to the end of connector k (the merge point), measured
+   * along its own path; negative once it has passed onto the exit lane. Null if it isn't using k.
+   */
+  private mergeDistance(o: Vehicle, k: Connector): number | null {
+    const seg = this.net.segments[o.seg];
+    if (o.seg === k.id) return k.length - o.s;
+    if (o.grant === k.id && seg.kind === 'lane') return seg.length - o.s + k.length;
+    if (o.occupying === k.id && o.seg === k.toLane) return -o.s;
+    return null;
+  }
+
+  /**
+   * Gap acceptance for converging movements: the candidate may enter if, projected onto the shared
+   * exit lane, it ends up either behind every merging vehicle with at least its standstill gap, or
+   * ahead of it with room for that vehicle to keep following comfortably.
+   */
+  private mergeClear(v: Vehicle, c: Connector, usersOf: Map<number, Vehicle[]>): boolean {
+    const lane = this.net.segments[v.seg];
+    const dc = lane.length - v.s + c.length;
+    for (const kid of c.merges) {
+      const k = this.net.segments[kid] as Connector;
+      for (const o of usersOf.get(kid) ?? []) {
+        if (o === v) continue;
+        const d = this.mergeDistance(o, k);
+        if (d === null) continue;
+        if (dc >= d + o.p.length + v.p.minGap) continue;
+        if (d >= dc + v.p.length + o.p.minGap + o.v * o.p.headway * 0.5) continue;
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /** Nearest vehicle on (or granted onto) a converging movement that will be ahead of us at the merge point. */
+  private mergeLeader(c: Connector, distToEnd: number): { gap: number; v: number } | null {
+    let best: { gap: number; v: number } | null = null;
+    for (const kid of c.merges) {
+      const k = this.net.segments[kid] as Connector;
+      for (const o of this.mergeUsers.get(kid) ?? []) {
+        const d = this.mergeDistance(o, k);
+        if (d === null || d < 0 || d >= distToEnd) continue;
+        const gap = distToEnd - d - o.p.length;
+        if (!best || gap < best.gap) best = { gap, v: o.v };
+      }
+    }
+    return best;
+  }
+
+  private desiredSpeed(v: Vehicle, segId: number): number {
+    const seg = this.net.segments[segId];
+    return Math.min(v.v0 * this.laneEffect[segId][v.type].speed, seg.speedLimit);
+  }
+
+  private headwayOn(v: Vehicle, segId: number): number {
+    return v.p.headway * this.laneEffect[segId][v.type].headway;
   }
 
   // ---------------------------------------------------------------- longitudinal
@@ -515,14 +652,20 @@ export class Simulation {
         const o = this.occ[other][0];
         if (other !== c.id && o && o.s - o.p.length < 3 && (!near || o.s - o.p.length < near.s - near.p.length)) near = o;
       }
-      if (near) return { gap: ahead + near.s - near.p.length, dv: v.v - near.v, slowTo };
+      // The closest of: traffic in the junction mouth, the exit lane's tail, and merging traffic.
+      let best: { gap: number; dv: number; slowTo?: { dist: number; speed: number } } = { gap: Infinity, dv: 0, slowTo };
+      if (near) best = { gap: ahead + near.s - near.p.length, dv: v.v - near.v, slowTo };
       const tail = this.occ[c.toLane][0];
-      if (tail) return { gap: ahead + c.length + tail.s - tail.p.length, dv: v.v - tail.v, slowTo };
-      return { gap: Infinity, dv: 0, slowTo };
+      if (!near && tail) best = { gap: ahead + c.length + tail.s - tail.p.length, dv: v.v - tail.v, slowTo };
+      const m = this.mergeLeader(c, ahead + c.length);
+      if (m && m.gap < best.gap) best = { gap: m.gap, dv: v.v - m.v, slowTo };
+      return best;
     }
-    // On a connector: look into the exit lane, then at its far end.
+    // On a connector: vehicles merging ahead of us, then the exit lane, then its far end.
     const out = this.net.segments[seg.toLane] as Lane;
     const tail = this.occ[out.id][0];
+    const m = this.mergeLeader(seg, ahead);
+    if (m && (!tail || m.gap < ahead + tail.s - tail.p.length)) return { gap: m.gap, dv: v.v - m.v };
     if (tail) return { gap: ahead + tail.s - tail.p.length, dv: v.v - tail.v };
     ahead += out.length;
     const exiting = v.ri + 1 === v.route.length - 1 && this.net.nodes.get(out.toNode)!.isEndpoint;
@@ -531,18 +674,27 @@ export class Simulation {
   }
 
   private accelFor(v: Vehicle): number {
-    const seg = this.net.segments[v.seg];
-    const v0 = Math.min(v.v0, seg.speedLimit);
     const ob = this.obstacleAhead(v);
-    let a = idmAccel(v.p, v.v, v0, ob.gap, ob.dv);
+    let a = idmAccel(v.p, v.v, this.desiredSpeed(v, v.seg), ob.gap, ob.dv, this.headwayOn(v, v.seg));
     if (ob.slowTo && v.v > ob.slowTo.speed) {
       const need = (ob.slowTo.speed ** 2 - v.v ** 2) / (2 * Math.max(1, ob.slowTo.dist));
       a = Math.min(a, need);
     }
-    return Math.max(-v.p.maxDecel, Math.min(v.p.accel, a));
+    // Climbing a ramp costs g·sinθ of the available acceleration (heavy vehicles feel it most).
+    const maxAccel = Math.max(0.05, v.p.accel - G * this.grade[v.seg]);
+    return Math.max(-v.p.maxDecel, Math.min(maxAccel, a));
   }
 
   private move(): void {
+    this.mergeUsers.clear();
+    for (const v of this.vehicles) {
+      const seg = this.net.segments[v.seg];
+      const c = seg.kind === 'connector' ? seg.id : v.grant;
+      if (c === null || (this.net.segments[c] as Connector).merges.length === 0) continue;
+      const list = this.mergeUsers.get(c) ?? [];
+      list.push(v);
+      this.mergeUsers.set(c, list);
+    }
     for (const v of this.vehicles) v.acc = this.accelFor(v);
     const exited: Vehicle[] = [];
     for (const v of this.vehicles) {
@@ -670,7 +822,12 @@ export class Simulation {
 
   // ---------------------------------------------------------------- lateral
 
-  private neighbours(laneId: number, s: number): { lead: Vehicle | null; follow: Vehicle | null } {
+  /**
+   * Leader and follower around position s on a lane. With nobody behind on the lane itself, the
+   * follower is the nearest vehicle still crossing the junction into this lane, at a negative
+   * position (distance before the lane start).
+   */
+  private neighbours(laneId: number, s: number): { lead: Vehicle | null; follow: Vehicle | null; followS: number } {
     const list = this.occ[laneId];
     let lead: Vehicle | null = null;
     let follow: Vehicle | null = null;
@@ -681,13 +838,24 @@ export class Simulation {
       }
       follow = o;
     }
-    return { lead, follow };
+    if (follow) return { lead, follow, followS: follow.s };
+    let followS = -Infinity;
+    for (const cid of this.connectorsInto[laneId]) {
+      const c = this.net.segments[cid] as Connector;
+      const o = this.occ[cid][this.occ[cid].length - 1];
+      if (o && o.s - c.length > followS) {
+        follow = o;
+        followS = o.s - c.length;
+      }
+    }
+    return { lead, follow, followS };
   }
 
   private idmWith(v: Vehicle, s: number, leader: Vehicle | null, laneId: number): number {
-    const v0 = Math.min(v.v0, this.net.segments[laneId].speedLimit);
-    if (!leader) return idmAccel(v.p, v.v, v0, Infinity, 0);
-    return idmAccel(v.p, v.v, v0, leader.s - leader.p.length - s, v.v - leader.v);
+    const v0 = this.desiredSpeed(v, laneId);
+    const T = this.headwayOn(v, laneId);
+    if (!leader) return idmAccel(v.p, v.v, v0, Infinity, 0, T);
+    return idmAccel(v.p, v.v, v0, leader.s - leader.p.length - s, v.v - leader.v, T);
   }
 
   /** MOBIL lane changing (Kesting, Treiber & Helbing 2007) plus mandatory changes for route-following. */
@@ -721,16 +889,16 @@ export class Simulation {
       const oldFollow = curIdx > 0 ? this.occ[seg.id][curIdx - 1] : null;
       const aCur = this.idmWith(v, v.s, realLead, seg.id);
       for (const target of candidates) {
-        const { lead, follow } = this.neighbours(target, v.s);
+        const { lead, follow, followS } = this.neighbours(target, v.s);
         if (lead && lead.s - lead.p.length - v.s < minGap) continue;
-        if (follow && v.s - v.p.length - follow.s < minGap) continue;
+        if (follow && v.s - v.p.length - followS < minGap) continue;
         const aNew = this.idmWith(v, v.s, lead, target);
         // In stationary queues vehicles let each other in (zipper merge), so only moving traffic is judged on braking.
         if (aNew < -bSafe && v.v > 1) continue;
-        const nfAfter = follow ? this.idmWith(follow, follow.s, v, target) : 0;
+        const nfAfter = follow ? this.idmWith(follow, followS, v, target) : 0;
         if (follow && nfAfter < -bSafe && !(mandatory && follow.v < 1)) continue;
         if (follow && follow.grant !== null) continue;
-        const nfBefore = follow ? this.idmWith(follow, follow.s, lead, target) : 0;
+        const nfBefore = follow ? this.idmWith(follow, followS, lead, target) : 0;
         const ofBefore = oldFollow ? this.idmWith(oldFollow, oldFollow.s, v, seg.id) : 0;
         const ofAfter = oldFollow ? this.idmWith(oldFollow, oldFollow.s, realLead, seg.id) : 0;
         const gain = aNew - aCur + v.p.politeness * (nfAfter - nfBefore + ofAfter - ofBefore);

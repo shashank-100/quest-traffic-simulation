@@ -48,7 +48,10 @@ export interface Connector {
   turn: Turn;
   speedLimit: number;
   level: Level;
+  /** Movements whose paths cross this one: never occupied at the same time. */
   conflicts: number[];
+  /** Movements converging into the same exit lane: may be shared if vehicles are staggered. */
+  merges: number[];
 }
 
 export type Segment = Lane | Connector;
@@ -99,6 +102,8 @@ export interface Network {
 }
 
 const CONFLICT_DISTANCE = 2.0;
+/** Converging paths closer than this before their final 30 % are treated as crossing, not merging. */
+const MERGE_CLEARANCE = 0.5;
 
 export function roadWidth(r: RoadDef): number {
   return (r.lanesFwd + r.lanesBwd) * r.laneWidth;
@@ -316,6 +321,7 @@ export function buildNetwork(scenario: Scenario): Network {
             speedLimit: Math.max(4, Math.min(lin.speedLimit, lout.speedLimit, turnSpeed)),
             level: node.level,
             conflicts: [],
+            merges: [],
           };
           segments.push(c);
           connectors.push(c);
@@ -325,13 +331,19 @@ export function buildNetwork(scenario: Scenario): Network {
         }
       }
     }
-    // Conflicts: movements that merge into the same lane or whose swept paths cross or come too close.
+    // Conflicts. Two movements into the same exit lane are a *merge* when they converge without
+    // crossing over each other first; merges are handled by gap acceptance (vehicles staggered along
+    // the shared exit). Otherwise paths that cross or pass within CONFLICT_DISTANCE are a *crossing*
+    // conflict and are never occupied at the same time.
     for (let a = 0; a < node.connectors.length; a++) {
       for (let b = a + 1; b < node.connectors.length; b++) {
         const ca = segments[node.connectors[a]] as Connector;
         const cb = segments[node.connectors[b]] as Connector;
         if (ca.fromLane === cb.fromLane) continue;
-        if (ca.toLane === cb.toLane || ca.path.minDistanceTo(cb.path) < CONFLICT_DISTANCE) {
+        if (ca.toLane === cb.toLane && headOf(ca.path).minDistanceTo(headOf(cb.path)) > MERGE_CLEARANCE) {
+          ca.merges.push(cb.id);
+          cb.merges.push(ca.id);
+        } else if (ca.toLane === cb.toLane || ca.path.minDistanceTo(cb.path) < CONFLICT_DISTANCE) {
           ca.conflicts.push(cb.id);
           cb.conflicts.push(ca.id);
         }
@@ -373,6 +385,17 @@ export function buildNetwork(scenario: Scenario): Network {
     exitEdges,
     warnings,
   };
+}
+
+/** The first 70 % of a path: where two converging movements must not cross each other. */
+function headOf(path: Path): Path {
+  const pts = [];
+  const n = 10;
+  for (let i = 0; i <= n; i++) {
+    const p = path.pose((path.length * 0.7 * i) / n);
+    pts.push({ x: p.x, y: p.y });
+  }
+  return new Path(pts);
 }
 
 /** Elevation (0..1) at arc length s on a segment — ramps interpolate between their end levels. */

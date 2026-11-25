@@ -51,7 +51,7 @@ describe('road network compilation', () => {
     expect(j.connectors.map((c) => (net.segments[c] as Connector).turn).filter((t) => t === 'straight')).toHaveLength(8);
   });
 
-  it('marks crossing and merging movements as conflicts, but not parallel ones', () => {
+  it('classifies crossing movements as conflicts and converging ones as merges, but not parallel ones', () => {
     const net = buildNetwork(preset('four-way'));
     const j = [...net.nodes.values()].find((n) => n.degree === 4)!;
     const conns = j.connectors.map((c) => net.segments[c] as Connector);
@@ -67,9 +67,15 @@ describe('road network compilation', () => {
     expect(east[0].conflicts).not.toContain(east[1].id); // parallel lanes
     expect(east[0].conflicts).not.toContain(west[0].id); // opposing through traffic
     expect(east[0].conflicts).toContain(south[0].id); // crossing
+    let merges = 0;
     for (const a of conns) for (const b of conns) {
-      if (a !== b && a.toLane === b.toLane && a.fromLane !== b.fromLane) expect(a.conflicts).toContain(b.id); // merging
+      if (a === b || a.toLane !== b.toLane || a.fromLane === b.fromLane) continue;
+      // Converging into one lane is a merge (gap acceptance) unless the paths also cross earlier.
+      expect(a.merges.includes(b.id) || a.conflicts.includes(b.id)).toBe(true);
+      expect(a.merges.includes(b.id) && a.conflicts.includes(b.id)).toBe(false);
+      if (a.merges.includes(b.id)) merges++;
     }
+    expect(merges).toBeGreaterThan(0);
   });
 
   it('ignores roads that reference missing nodes and reports a warning', () => {
