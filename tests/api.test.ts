@@ -2,16 +2,22 @@ import { describe, expect, it } from 'vitest';
 import worker from '../src/worker/index';
 import { preset } from '../src/engine';
 
-/** In-memory stand-in for a KV namespace, enough for the API's get/put calls. */
+/** In-memory stand-in for a KV namespace: get, put (with metadata) and lexicographic prefix listing. */
 function memoryKv() {
-  const store = new Map<string, string>();
+  const store = new Map<string, { value: string; metadata?: unknown }>();
   return {
     async get(key: string, type?: string) {
-      const v = store.get(key) ?? null;
+      const v = store.get(key)?.value ?? null;
       return v !== null && type === 'json' ? JSON.parse(v) : v;
     },
-    async put(key: string, value: string) {
-      store.set(key, value);
+    async put(key: string, value: string, opts?: { metadata?: unknown }) {
+      // Yield first, so concurrent requests interleave as they would against a real store.
+      await Promise.resolve();
+      store.set(key, { value, metadata: opts?.metadata });
+    },
+    async list({ prefix = '', limit = 1000 }: { prefix?: string; limit?: number }) {
+      const names = [...store.keys()].filter((k) => k.startsWith(prefix)).sort().slice(0, limit);
+      return { keys: names.map((name) => ({ name, metadata: store.get(name)!.metadata })), list_complete: true };
     },
   };
 }
@@ -33,6 +39,19 @@ describe('backend API', () => {
     const loaded = (await (await call(e, `/api/scenarios/${meta.id}`)).json()) as typeof sc;
     expect(loaded.roads).toEqual(sc.roads);
     expect((await call(e, '/api/scenarios/doesnotexist')).status).toBe(404);
+  });
+
+  it('lists every one of many concurrent saves, newest first', async () => {
+    const e = env();
+    const saves = await Promise.all(
+      Array.from({ length: 10 }, (_, i) => call(e, '/api/scenarios', { method: 'POST', body: JSON.stringify({ ...preset('t-junction'), name: `race ${i}` }) })),
+    );
+    expect(saves.every((r) => r.status === 201)).toBe(true);
+    const ids = await Promise.all(saves.map(async (r) => ((await r.json()) as { id: string }).id));
+    const list = (await (await call(e, '/api/scenarios')).json()) as { scenarios: { id: string; createdAt: string }[] };
+    expect(list.scenarios.map((s) => s.id).sort()).toEqual([...ids].sort());
+    const times = list.scenarios.map((s) => Date.parse(s.createdAt));
+    expect(times).toEqual([...times].sort((a, b) => b - a));
   });
 
   it('rejects invalid scenarios with a 400', async () => {

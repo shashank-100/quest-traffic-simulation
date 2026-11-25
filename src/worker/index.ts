@@ -22,7 +22,18 @@ interface Meta {
 
 const MAX_BODY = 512 * 1024;
 const MAX_SIM_SECONDS = 600;
-const RECENT_KEY = 'index:recent';
+const RECENT_LIMIT = 30;
+/** Index entries sort newest first: the key embeds (MAX_TIME − saved-at), zero-padded. */
+const RECENT_PREFIX = 'recent:';
+const MAX_TIME = 9_999_999_999_999;
+
+/**
+ * Every save writes its own index entry instead of rewriting a shared list, so saves made at the same
+ * time never overwrite each other. The newest entries are read back with a single key listing.
+ */
+function recentKey(meta: Meta): string {
+  return `${RECENT_PREFIX}${String(MAX_TIME - Date.parse(meta.createdAt)).padStart(13, '0')}:${meta.id}`;
+}
 
 const json = (data: unknown, status = 200) =>
   new Response(JSON.stringify(data), {
@@ -65,13 +76,13 @@ async function handle(req: Request, env: Env): Promise<Response> {
     const scenario = parseScenario(await readJson(req));
     const meta: Meta = { id: newId(), name: scenario.name, createdAt: new Date().toISOString() };
     await env.SCENARIOS.put(`scenario:${meta.id}`, JSON.stringify({ ...scenario, id: meta.id }), { metadata: meta });
-    const recent = ((await env.SCENARIOS.get<Meta[]>(RECENT_KEY, 'json')) ?? []).filter((m) => m.id !== meta.id);
-    await env.SCENARIOS.put(RECENT_KEY, JSON.stringify([meta, ...recent].slice(0, 30)));
+    await env.SCENARIOS.put(recentKey(meta), '', { metadata: meta });
     return json(meta, 201);
   }
 
   if (path === '/api/scenarios' && req.method === 'GET') {
-    return json({ scenarios: (await env.SCENARIOS.get<Meta[]>(RECENT_KEY, 'json')) ?? [] });
+    const listed = await env.SCENARIOS.list<Meta>({ prefix: RECENT_PREFIX, limit: RECENT_LIMIT });
+    return json({ scenarios: listed.keys.flatMap((k) => (k.metadata ? [k.metadata] : [])) });
   }
 
   const m = /^\/api\/scenarios\/([a-z0-9]{4,32})$/.exec(path);

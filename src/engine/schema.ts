@@ -2,9 +2,15 @@ import type { FlowDef, NodeDef, RoadDef, Scenario, SignalDef } from './types';
 
 /**
  * Validates untrusted JSON (imports, API payloads) into a Scenario, clamping values to sane ranges.
- * Throws with a readable message when the shape is wrong.
+ * Throws with a readable message when the shape is wrong or the parts don't fit together.
  */
 export function parseScenario(raw: unknown): Scenario {
+  const scenario = parseShape(raw);
+  checkReferences(scenario);
+  return scenario;
+}
+
+function parseShape(raw: unknown): Scenario {
   const o = obj(raw, 'scenario');
   const nodes = arr(o.nodes, 'nodes', 2000).map((n, i): NodeDef => {
     const x = obj(n, `nodes[${i}]`);
@@ -29,7 +35,7 @@ export function parseScenario(raw: unknown): Scenario {
       speedLimit: num(x.speedLimit, 2, 40),
     };
     if (typeof x.name === 'string') road.name = x.name.slice(0, 80);
-    if (!ids.has(road.from) || !ids.has(road.to)) throw new Error(`roads[${i}] references an unknown node`);
+    if (!ids.has(road.from) || !ids.has(road.to)) throw new Error(`Road ${road.id} references an unknown node`);
     return road;
   });
   const flows = arr(o.flows ?? [], 'flows', 500).map((f, i): FlowDef => {
@@ -60,6 +66,64 @@ export function parseScenario(raw: unknown): Scenario {
     roads,
     flows,
   };
+}
+
+/**
+ * Cross-checks a well-shaped scenario: unique ids, roads that make sense, signal phases that name
+ * roads at their own junction, and flows that enter and leave the network at real entry/exit points.
+ */
+function checkReferences(sc: Scenario): void {
+  unique(sc.nodes, 'node');
+  unique(sc.roads, 'road');
+  unique(sc.flows, 'flow');
+
+  const roadsAt = new Map<string, RoadDef[]>();
+  for (const r of sc.roads) {
+    if (r.from === r.to) throw new Error(`Road ${r.id} connects node ${r.from} to itself`);
+    if (r.lanesFwd + r.lanesBwd === 0) throw new Error(`Road ${r.id} has no lanes`);
+    for (const n of [r.from, r.to]) roadsAt.set(n, [...(roadsAt.get(n) ?? []), r]);
+  }
+
+  for (const n of sc.nodes) {
+    if (!n.signal) continue;
+    const here = new Set((roadsAt.get(n.id) ?? []).map((r) => r.id));
+    for (const [k, ph] of n.signal.phases.entries()) {
+      for (const a of ph.approaches) {
+        if (!here.has(a)) throw new Error(`Signal at node ${n.id}, phase ${k + 1}: road ${a} does not meet this junction`);
+      }
+    }
+  }
+
+  // An entry point is a dead-end node with a lane leading into the network; an exit has one leading out.
+  const endpoint = (id: string, dir: 'in' | 'out'): boolean => {
+    const at = roadsAt.get(id) ?? [];
+    if (at.length !== 1) return false;
+    const r = at[0];
+    const intoNetwork = r.from === id ? r.lanesFwd : r.lanesBwd;
+    const outOfNetwork = r.from === id ? r.lanesBwd : r.lanesFwd;
+    return (dir === 'in' ? intoNetwork : outOfNetwork) > 0;
+  };
+  const nodeIds = new Set(sc.nodes.map((n) => n.id));
+  for (const f of sc.flows) {
+    const label = `Flow ${f.name ? `"${f.name}"` : f.id}`;
+    if (!nodeIds.has(f.origin)) throw new Error(`${label}: origin ${f.origin} is not a node`);
+    if (!endpoint(f.origin, 'in')) throw new Error(`${label}: origin ${f.origin} is not an entry point (a road end with a lane into the network)`);
+    if (f.destination !== null) {
+      if (!nodeIds.has(f.destination)) throw new Error(`${label}: destination ${f.destination} is not a node`);
+      if (f.destination === f.origin) throw new Error(`${label}: destination is the same as the origin`);
+      if (!endpoint(f.destination, 'out')) throw new Error(`${label}: destination ${f.destination} is not an exit point (a road end with a lane out of the network)`);
+    }
+    if (f.mix.car + f.mix.bus + f.mix.bike + f.mix.truck <= 0) throw new Error(`${label}: vehicle mix is empty`);
+    if (f.end < f.start) throw new Error(`${label}: ends before it starts`);
+  }
+}
+
+function unique(items: { id: string }[], what: string): void {
+  const seen = new Set<string>();
+  for (const { id } of items) {
+    if (seen.has(id)) throw new Error(`Duplicate ${what} id "${id}"`);
+    seen.add(id);
+  }
 }
 
 function signal(raw: unknown, i: number): SignalDef {
